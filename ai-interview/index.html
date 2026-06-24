@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GazeProctor — AI Interview &amp; Proctoring</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="./css/style.css" />
+</head>
+<body>
+  <!-- ============================================================= -->
+  <!-- CALIBRATION OVERLAY (neutral-baseline capture)                -->
+  <!-- ============================================================= -->
+  <div id="calibration-overlay" class="overlay" aria-hidden="false">
+    <!-- Center target: "look here and hold still" during the 3s baseline -->
+    <div id="cal-center">
+      <div id="cal-center-dot"></div>
+      <div id="cal-countdown">3</div>
+      <div id="cal-center-label">Look here &amp; hold still</div>
+    </div>
+
+    <!-- Instruction / control card -->
+    <div class="glass cal-card" id="cal-card">
+      <div class="cal-badge">
+        <span class="dot-pulse"></span> Calibration
+      </div>
+      <h1 id="cal-title">Welcome to GazeProctor</h1>
+      <p id="cal-instructions">
+        This session uses your webcam and Google MediaPipe to verify you stay focused on the
+        screen. All video is processed entirely in your browser and never uploaded. Click
+        <strong>Start</strong> to grant camera access and capture a quick neutral baseline.
+      </p>
+
+      <ul class="cal-steps" id="cal-steps">
+        <li>Grant webcam permission when prompted.</li>
+        <li>Sit naturally and look <strong>straight at the screen</strong>.</li>
+        <li>Hold still for a <strong>3-second</strong> baseline capture.</li>
+      </ul>
+
+      <div id="cal-status" class="cal-status">Camera not started.</div>
+
+      <div class="cal-actions">
+        <button id="cal-start-btn" class="btn btn-primary">Start &amp; Calibrate</button>
+        <button id="cal-mode-btn" class="btn btn-ghost" title="Quick = 3s neutral baseline. 4-corner = look at each screen corner so thresholds match your exact screen size and seating.">
+          Calibration: <span id="cal-mode-state">Quick</span>
+        </button>
+        <button id="cal-skip-fs" class="btn btn-ghost" title="Recommended: fullscreen aligns the viewport with your physical screen">
+          Fullscreen: <span id="cal-fs-state">On</span>
+        </button>
+      </div>
+      <p class="cal-hint" id="cal-accuracy-hint" hidden></p>
+    </div>
+  </div>
+
+  <!-- ============================================================= -->
+  <!-- LOOKING-AWAY WARNING FLASH                                     -->
+  <!-- ============================================================= -->
+  <div id="gaze-warning" aria-hidden="true">
+    <div class="gaze-warning-pill">
+      <span class="gaze-warning-icon">&#9888;</span>
+      <span id="gaze-warning-text">Looking away</span>
+    </div>
+  </div>
+
+  <!-- ============================================================= -->
+  <!-- APP SHELL                                                     -->
+  <!-- ============================================================= -->
+  <div id="app" class="app" aria-hidden="true">
+    <!-- Top bar -->
+    <header class="topbar glass">
+      <div class="brand">
+        <div class="brand-mark">GP</div>
+        <div class="brand-text">
+          <span class="brand-title">GazeProctor</span>
+          <span class="brand-sub">AI Interview &amp; Proctoring</span>
+        </div>
+      </div>
+
+      <div class="topbar-status">
+        <div class="status-chip" id="focus-chip" data-state="ok">
+          <span class="status-led"></span>
+          <span class="status-chip-label">Focus</span>
+          <span class="status-chip-value" id="focus-state">Focused</span>
+        </div>
+        <div class="status-chip">
+          <span class="status-chip-label">Tracking</span>
+          <span class="status-chip-value" id="accuracy-value">—</span>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <button id="btn-fullscreen" class="btn btn-ghost btn-sm">Fullscreen</button>
+        <button id="btn-recalibrate" class="btn btn-ghost btn-sm">Recalibrate</button>
+        <button id="btn-finish" class="btn btn-danger btn-sm">Finish Interview</button>
+      </div>
+    </header>
+
+    <!-- Main grid -->
+    <main class="layout">
+      <!-- Interview panel -->
+      <section class="card glass interview-card">
+        <div class="card-head">
+          <h2 class="card-title">Interview</h2>
+          <span class="pill" id="question-counter">Question 1 / 1</span>
+        </div>
+
+        <div class="question-block">
+          <span class="question-tag" id="question-category">General</span>
+          <p class="question-text" id="question-text">Loading question…</p>
+        </div>
+
+        <div class="answer-block">
+          <div class="answer-head">
+            <label for="answer-input">Your answer</label>
+            <span id="record-status" class="record-status">Idle</span>
+          </div>
+          <textarea
+            id="answer-input"
+            class="answer-input"
+            rows="6"
+            placeholder="Type your answer, or click 'Record Answer' to dictate with your voice…"
+          ></textarea>
+        </div>
+
+        <div class="interview-controls">
+          <button id="btn-speak" class="btn btn-ghost">🔊 Read Question</button>
+          <button id="btn-record" class="btn btn-accent">🎙️ Record Answer</button>
+          <div class="spacer"></div>
+          <button id="btn-prev" class="btn btn-ghost">‹ Prev</button>
+          <button id="btn-next" class="btn btn-primary">Next ›</button>
+        </div>
+      </section>
+
+      <!-- Camera feed card -->
+      <section class="card glass camera-card">
+        <div class="card-head">
+          <h2 class="card-title">Live Camera</h2>
+          <span class="pill" id="gaze-badge" data-state="ok">On screen</span>
+        </div>
+        <!-- MediaPipe video + landmark overlay (both mirrored via CSS) -->
+        <div id="camera-host" class="camera-host">
+          <video id="cam-video" class="cam-video" autoplay muted playsinline></video>
+          <canvas id="cam-overlay" class="cam-overlay"></canvas>
+          <div class="camera-placeholder" id="camera-placeholder">
+            Camera preview will appear here after you start.
+          </div>
+          <!-- Live head/eye telemetry -->
+          <div id="hud-telemetry" class="hud-telemetry" hidden>
+            <span>yaw <b id="hud-yaw">0</b>°</span>
+            <span>pitch <b id="hud-pitch">0</b>°</span>
+            <span>gaze <b id="hud-gaze">0,0</b></span>
+          </div>
+        </div>
+        <div class="camera-legend">
+          <span><i class="legend-dot legend-gaze"></i> Iris</span>
+          <span><i class="legend-dot legend-face"></i> Face mesh / head pose</span>
+        </div>
+      </section>
+
+      <!-- Proctoring dashboard -->
+      <section class="card glass proctor-card">
+        <div class="card-head">
+          <h2 class="card-title">Proctoring Audit</h2>
+          <div class="proctor-export">
+            <button id="btn-download-json" class="btn btn-ghost btn-sm">JSON</button>
+            <button id="btn-download-csv" class="btn btn-ghost btn-sm">CSV</button>
+          </div>
+        </div>
+
+        <div class="metric-row">
+          <div class="metric">
+            <span class="metric-value" id="metric-flags">0</span>
+            <span class="metric-label">Total Flags</span>
+          </div>
+          <div class="metric">
+            <span class="metric-value" id="metric-offscreen">0</span>
+            <span class="metric-label">Looking Away</span>
+          </div>
+          <div class="metric">
+            <span class="metric-value" id="metric-tabswitch">0</span>
+            <span class="metric-label">Tab Switches</span>
+          </div>
+          <div class="metric">
+            <span class="metric-value" id="metric-facelost">0</span>
+            <span class="metric-label">Face Lost</span>
+          </div>
+        </div>
+
+        <div class="timeline-head">
+          <span>Incident Timeline</span>
+          <span id="integrity-score" class="integrity-score">Integrity: 100%</span>
+        </div>
+        <ul id="incident-list" class="incident-list">
+          <li class="incident-empty" id="incident-empty">No incidents logged yet. You're doing great.</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="appfoot">
+      <span>All processing runs locally in your browser · No video leaves this device.</span>
+      <span id="session-clock">00:00</span>
+    </footer>
+  </div>
+
+  <!-- ============================================================= -->
+  <!-- SUMMARY MODAL (Finish)                                        -->
+  <!-- ============================================================= -->
+  <div id="summary-overlay" class="overlay" aria-hidden="true" hidden>
+    <div class="glass summary-card">
+      <h2>Interview Complete</h2>
+      <p class="summary-sub">Here is your proctoring summary.</p>
+      <div class="summary-grid" id="summary-grid"></div>
+      <div class="summary-actions">
+        <button id="summary-json" class="btn btn-primary">Download JSON Report</button>
+        <button id="summary-csv" class="btn btn-ghost">Download CSV Report</button>
+        <button id="summary-close" class="btn btn-ghost">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Engine is an ES module (imports MediaPipe Tasks Vision); exposes window.GazeEngine. -->
+  <script type="module" src="./js/gaze-engine.js"></script>
+  <!-- App logic (classic scripts): interview.js (TTS/STT) and proctor.js (proctoring). -->
+  <script src="./js/interview.js"></script>
+  <script src="./js/proctor.js"></script>
+</body>
+</html>
