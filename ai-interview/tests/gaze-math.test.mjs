@@ -2,8 +2,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  matrixToEuler, ratio, computeIrisGaze, computeBlendshapeGaze, decideLookingAway,
-  deriveThresholdsFromCorners, makeSmoother, DEFAULT_THRESHOLDS, EYE,
+  matrixToEuler, ratio, computeIrisGaze, computeBlendshapeGaze, decideLookingAway, computeCombined,
+  deriveThresholdsFromCorners, adaptBaseline, makeSmoother, DEFAULT_THRESHOLDS, EYE,
 } from "../js/gaze-math.mjs";
 
 const DEG = Math.PI / 180;
@@ -105,52 +105,93 @@ test("computeIrisGaze: too few landmarks → valid=false", () => {
 
 const base = { yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 };
 const sig = (o) => Object.assign({ facePresent: true, yaw: 0, pitch: 0, roll: 0, gazeX: 0, gazeY: 0 }, o);
+// Sign-neutral cfg for logic tests written as "yaw+ = right" (the default now inverts yaw).
+const NOINV = Object.assign({}, DEFAULT_THRESHOLDS, { INVERT_YAW: false });
 
-test("decideLookingAway: neutral → not away", () => {
-  assert.equal(decideLookingAway(sig({}), base).lookingAway, false);
+test("decideLookingAway: neutral → level none", () => {
+  assert.equal(decideLookingAway(sig({}), base).level, "none");
 });
 
-test("decideLookingAway: head yaw beyond threshold → away", () => {
-  const r1 = decideLookingAway(sig({ yaw: 25 }), base);
-  assert.ok(r1.lookingAway && r1.direction === "right");
-  const r2 = decideLookingAway(sig({ yaw: -25 }), base);
-  assert.ok(r2.lookingAway && r2.direction === "left");
+test("decideLookingAway: strong head yaw → hard, correct direction", () => {
+  const r1 = decideLookingAway(sig({ yaw: 40 }), base, NOINV);
+  assert.ok(r1.level === "hard" && r1.direction === "right", JSON.stringify(r1));
+  assert.ok(r1.confidence >= 0.8);
+  const r2 = decideLookingAway(sig({ yaw: -40 }), base, NOINV);
+  assert.ok(r2.level === "hard" && r2.direction === "left");
 });
 
-test("decideLookingAway: head pitch down → away down", () => {
-  const r = decideLookingAway(sig({ pitch: 20 }), base);
-  assert.ok(r.lookingAway && r.direction === "down");
+test("decideLookingAway: INVERT_YAW (default) flips head-yaw sign", () => {
+  // MediaPipe head-right = negative raw yaw; default inverts so it reads "right".
+  assert.equal(decideLookingAway(sig({ yaw: -40 }), base).direction, "right");
+  assert.equal(decideLookingAway(sig({ yaw: 40 }), base).direction, "left");
 });
 
-test("decideLookingAway: eyes off-center (head still) → away", () => {
-  const r = decideLookingAway(sig({ gazeX: 0.6 }), base);
-  assert.ok(r.lookingAway && r.direction === "right");
+test("decideLookingAway: moderate head yaw → soft (possible) with mid confidence", () => {
+  const r = decideLookingAway(sig({ yaw: 25 }), base, NOINV);
+  assert.ok(r.level === "soft" && r.direction === "right", JSON.stringify(r));
+  assert.ok(r.confidence >= 0.5 && r.confidence < 0.8, `conf=${r.confidence}`);
 });
 
-test("decideLookingAway: eyes down → away down", () => {
-  const r = decideLookingAway(sig({ gazeY: 0.5 }), base);
-  assert.ok(r.lookingAway && r.direction === "down", JSON.stringify(r));
+test("decideLookingAway: head pitch down/up → hard down/up", () => {
+  assert.equal(decideLookingAway(sig({ pitch: 35 }), base).direction, "down");
+  assert.equal(decideLookingAway(sig({ pitch: 35 }), base).level, "hard");
+  assert.equal(decideLookingAway(sig({ pitch: -35 }), base).direction, "up");
 });
 
-test("decideLookingAway: eyes up → away up", () => {
-  const r = decideLookingAway(sig({ gazeY: -0.5 }), base);
-  assert.ok(r.lookingAway && r.direction === "up", JSON.stringify(r));
+test("decideLookingAway: down needs less tilt than up (asymmetric thresholds)", () => {
+  // 22° down → hard (down hard = 20); 22° up → only soft (up hard = 30)
+  const d = decideLookingAway(sig({ pitch: 22 }), base);
+  assert.ok(d.direction === "down" && d.level === "hard", JSON.stringify(d));
+  const u = decideLookingAway(sig({ pitch: -22 }), base);
+  assert.ok(u.direction === "up" && u.level === "soft", JSON.stringify(u));
 });
 
-test("decideLookingAway: head pitched up → away up", () => {
-  const r = decideLookingAway(sig({ pitch: -16 }), base);
-  assert.ok(r.lookingAway && r.direction === "up", JSON.stringify(r));
+test("decideLookingAway: eyes-only (head still) reach hard at extreme", () => {
+  const r = decideLookingAway(sig({ gazeX: 1 }), base); // 40*1 = 40 >= hard 36
+  assert.ok(r.level === "hard" && r.direction === "right", JSON.stringify(r));
+  const soft = decideLookingAway(sig({ gazeX: 0.6 }), base); // 24 → soft
+  assert.equal(soft.level, "soft");
 });
 
-test("decideLookingAway: baseline-relative (offset baseline cancels)", () => {
-  // user sits with head turned 20° as their neutral; same pose must NOT flag
+test("decideLookingAway: eyes-only down/up via combined pitch", () => {
+  assert.equal(decideLookingAway(sig({ gazeY: 1 }), base).direction, "down"); // 30 >= hard 30
+  assert.equal(decideLookingAway(sig({ gazeY: 1 }), base).level, "hard");
+  assert.equal(decideLookingAway(sig({ gazeY: -1 }), base).direction, "up");
+});
+
+test("decideLookingAway: combined head+eye reinforce", () => {
+  // head 15° right + eyes 0.6 right → 15 + 40*w*0.6; w=eyeWeight(15)=0.4 → 15+9.6=24.6 → soft,
+  // and pushing eyes further crosses hard
+  const r = decideLookingAway(sig({ yaw: 20, gazeX: 0.8 }), base, NOINV);
+  assert.ok(r.level !== "none" && r.direction === "right", JSON.stringify(r));
+});
+
+test("decideLookingAway: head-gated eye (#3) — far head turn suppresses eye term", () => {
+  // head exactly at gate (25°) → eye weight 0 → eyes can't add; combined = 25 → soft (not hard)
+  const r = decideLookingAway(sig({ yaw: 25, gazeX: 1 }), base);
+  assert.equal(r.level, "soft", JSON.stringify(r));
+});
+
+test("decideLookingAway: baseline-relative (off-axis neutral cancels)", () => {
   const b = { yaw: 20, pitch: 0, gazeX: 0, gazeY: 0 };
-  assert.equal(decideLookingAway(sig({ yaw: 22 }), b).lookingAway, false);
-  assert.equal(decideLookingAway(sig({ yaw: 42 }), b).lookingAway, true);
+  assert.equal(decideLookingAway(sig({ yaw: 22 }), b).level, "none");
+  assert.equal(decideLookingAway(sig({ yaw: 60 }), b).level, "hard");
 });
 
-test("decideLookingAway: no face → not away", () => {
-  assert.equal(decideLookingAway(sig({ facePresent: false, yaw: 90 }), base).lookingAway, false);
+test("decideLookingAway: no face → level none", () => {
+  assert.equal(decideLookingAway(sig({ facePresent: false, yaw: 90 }), base).level, "none");
+});
+
+test("computeCombined: eye weight gates to 0 at HEAD_GATE_DEG", () => {
+  const c = computeCombined(sig({ yaw: 25, gazeX: 1 }), base, NOINV);
+  assert.ok(near(c.eyeWeightX, 0), `wX=${c.eyeWeightX}`);
+  assert.ok(near(c.yaw, 25), `yaw=${c.yaw}`);
+});
+
+test("computeCombined: full eye weight near neutral head", () => {
+  const c = computeCombined(sig({ yaw: 0, gazeX: 0.5 }), base, NOINV);
+  assert.ok(near(c.eyeWeightX, 1));
+  assert.ok(near(c.yaw, NOINV.EYE_GAIN_X * 0.5), `yaw=${c.yaw}`); // gain * weight * gaze
 });
 
 test("makeSmoother: moving average over window", () => {
@@ -160,6 +201,37 @@ test("makeSmoother: moving average over window", () => {
   assert.equal(s.push(30), 25); // window drops the 10 → (20+30)/2
   s.reset();
   assert.equal(s.value(), 0);
+});
+
+test("adaptBaseline: single EMA step moves toward signal by alpha", () => {
+  const b0 = { yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 };
+  const sigv = { yaw: 12, pitch: -10, gazeX: 0.5, gazeY: 0.4 };
+  const b1 = adaptBaseline(b0, sigv, 0.5);
+  assert.ok(near(b1.yaw, 6) && near(b1.pitch, -5) && near(b1.gazeX, 0.25) && near(b1.gazeY, 0.2));
+});
+
+test("adaptBaseline: gazeAlpha=0 freezes eye baseline, head still adapts", () => {
+  // a sustained eye glance must NOT be absorbed (eye baseline stays put)
+  let b = { yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 };
+  const look = { yaw: 0, pitch: 0, gazeX: 0.8, gazeY: 0.5 };
+  for (let i = 0; i < 200; i++) b = adaptBaseline(b, look, 0.04, 0);
+  assert.ok(near(b.gazeX, 0) && near(b.gazeY, 0), `eye drifted: ${JSON.stringify(b)}`);
+  // head still converges
+  let h = { yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 };
+  const rest = { yaw: 14, pitch: -9, gazeX: 0, gazeY: 0 };
+  for (let i = 0; i < 200; i++) h = adaptBaseline(h, rest, 0.04, 0);
+  assert.ok(near(h.yaw, 14, 0.2) && near(h.pitch, -9, 0.2), JSON.stringify(h));
+});
+
+test("adaptBaseline: converges toward a settled resting pose", () => {
+  // simulate a stale baseline (0) while the user actually rests at yaw 12, pitch -11.
+  let b = { yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 };
+  const rest = { yaw: 12, pitch: -11, gazeX: 0.47, gazeY: 0.46 };
+  for (let i = 0; i < 120; i++) b = adaptBaseline(b, rest, 0.04); // ~5s at 24fps
+  assert.ok(near(b.yaw, 12, 0.5) && near(b.pitch, -11, 0.5), JSON.stringify(b));
+  // after convergence, the resting pose reads as on-screen
+  const d = decideLookingAway({ facePresent: true, ...rest, roll: 0 }, b, DEFAULT_THRESHOLDS);
+  assert.equal(d.level, "none");
 });
 
 // ---- blendshape eye gaze ----
@@ -219,53 +291,60 @@ test("computeBlendshapeGaze: off-screen eye glance crosses default threshold", (
     eyeLookUpLeft: 0, eyeLookUpRight: 0, eyeLookDownLeft: 0, eyeLookDownRight: 0,
   }));
   const decision = decideLookingAway(sig({ gazeX: g.gazeX }), base);
-  assert.ok(decision.lookingAway && decision.direction === "right", JSON.stringify(decision));
+  assert.ok(decision.level !== "none" && decision.direction === "right", JSON.stringify(decision));
 });
 
-// ---- 4-corner calibration ----
-const FLOORS = { YAW_DEG: 10, PITCH: 10, GAZE_X: 0.18, GAZE_Y_DOWN: 0.22 };
+// ---- 4-corner calibration (combined-gaze soft/hard derivation) ----
+const FLOORS = { SOFT_YAW: 15, TOL_YAW: 8, SOFT_PITCH: 14, TOL_PITCH: 8 };
+// head-only corners (gazeX/Y = 0) so combined == head deviation, easy to verify
+const headCorners = (yawSpan, pitchSpan) => [
+  { yaw: -yawSpan, pitch: -pitchSpan, gazeX: 0, gazeY: 0 },
+  { yaw: yawSpan, pitch: -pitchSpan, gazeX: 0, gazeY: 0 },
+  { yaw: -yawSpan, pitch: pitchSpan, gazeX: 0, gazeY: 0 },
+  { yaw: yawSpan, pitch: pitchSpan, gazeX: 0, gazeY: 0 },
+];
 
-test("deriveThresholdsFromCorners: span × margin, centered baseline", () => {
-  const corners = [
-    { yaw: -20, pitch: -10, gazeX: -0.3, gazeY: -0.2 }, // top-left
-    { yaw: 20, pitch: -10, gazeX: 0.3, gazeY: -0.2 },   // top-right
-    { yaw: -20, pitch: 10, gazeX: -0.3, gazeY: 0.2 },   // bottom-left
-    { yaw: 20, pitch: 10, gazeX: 0.3, gazeY: 0.2 },     // bottom-right
-  ];
-  const r = deriveThresholdsFromCorners(corners, FLOORS, 1.15);
+test("deriveThresholdsFromCorners: combined span × soft/hard margins", () => {
+  const r = deriveThresholdsFromCorners(headCorners(20, 10), DEFAULT_THRESHOLDS, FLOORS, 1.1, 1.4);
   assert.ok(near(r.baseline.yaw, 0) && near(r.baseline.pitch, 0));
-  assert.ok(near(r.thresholds.YAW_DEG, 23, 1e-6), `YAW=${r.thresholds.YAW_DEG}`);   // 20*1.15
-  assert.ok(near(r.thresholds.GAZE_X, 0.345, 1e-6), `GX=${r.thresholds.GAZE_X}`);   // 0.3*1.15
-  assert.ok(near(r.thresholds.PITCH_DOWN_DEG, 11.5, 1e-6));                          // 10*1.15
-  assert.ok(near(r.thresholds.GAZE_Y_UP, r.thresholds.GAZE_Y_DOWN), "up==down span");
+  assert.ok(near(r.thresholds.SOFT_YAW, 22, 1e-6), `SOFT_YAW=${r.thresholds.SOFT_YAW}`);   // 20*1.1
+  assert.ok(near(r.thresholds.TOL_YAW, 8, 1e-6), `TOL_YAW=${r.thresholds.TOL_YAW}`);        // max(20*0.3,8)=8
+  assert.ok(near(r.thresholds.SOFT_PITCH_DOWN, 14, 1e-6));                                   // max(10*1.1,14)=14
+  assert.equal(r.thresholds.SOFT_PITCH_UP, r.thresholds.SOFT_PITCH_DOWN);
 });
 
 test("deriveThresholdsFromCorners: tiny movement clamps to floors", () => {
-  const corners = [
-    { yaw: 1, pitch: 0.5, gazeX: 0.02, gazeY: 0.01 },
-    { yaw: -1, pitch: -0.5, gazeX: -0.02, gazeY: -0.01 },
-    { yaw: 0.5, pitch: 1, gazeX: 0.01, gazeY: 0.02 },
-    { yaw: -0.5, pitch: -1, gazeX: -0.01, gazeY: -0.02 },
-  ];
-  const r = deriveThresholdsFromCorners(corners, FLOORS, 1.15);
-  assert.equal(r.thresholds.YAW_DEG, 10);
-  assert.equal(r.thresholds.GAZE_X, 0.18);
-  assert.equal(r.thresholds.GAZE_Y_DOWN, 0.22);
+  const r = deriveThresholdsFromCorners(headCorners(1, 0.5), DEFAULT_THRESHOLDS, FLOORS, 1.1, 1.4);
+  assert.equal(r.thresholds.SOFT_YAW, 15);
+  assert.equal(r.thresholds.TOL_YAW, 8);
+  assert.equal(r.thresholds.SOFT_PITCH_DOWN, 14);
 });
 
 test("deriveThresholdsFromCorners: off-axis seating → non-zero baseline, span preserved", () => {
-  // candidate sits turned ~15° right; corners centered on yaw=15, span ±20
   const corners = [
     { yaw: -5, pitch: 0, gazeX: 0, gazeY: 0 },
     { yaw: 35, pitch: 0, gazeX: 0, gazeY: 0 },
     { yaw: -5, pitch: 0, gazeX: 0, gazeY: 0 },
     { yaw: 35, pitch: 0, gazeX: 0, gazeY: 0 },
   ];
-  const r = deriveThresholdsFromCorners(corners, FLOORS, 1.15);
+  const r = deriveThresholdsFromCorners(corners, DEFAULT_THRESHOLDS, FLOORS, 1.1, 1.4);
   assert.ok(near(r.baseline.yaw, 15), `baseYaw=${r.baseline.yaw}`);
-  assert.ok(near(r.thresholds.YAW_DEG, 23, 1e-6)); // dev=20 → 23
+  assert.ok(near(r.thresholds.SOFT_YAW, 22, 1e-6)); // dev=20 → 22
+});
+
+test("deriveThresholdsFromCorners: eye movement contributes to combined span", () => {
+  // corners reached with eyes (head still): gazeX ±0.5 at full eye weight → 40*0.5 = 20 combined
+  const corners = [
+    { yaw: 0, pitch: 0, gazeX: -0.5, gazeY: 0 },
+    { yaw: 0, pitch: 0, gazeX: 0.5, gazeY: 0 },
+    { yaw: 0, pitch: 0, gazeX: -0.5, gazeY: 0 },
+    { yaw: 0, pitch: 0, gazeX: 0.5, gazeY: 0 },
+  ];
+  const r = deriveThresholdsFromCorners(corners, DEFAULT_THRESHOLDS, FLOORS, 1.1, 1.4);
+  const expectedMax = DEFAULT_THRESHOLDS.EYE_GAIN_X * 0.5; // gain * weight(1) * 0.5
+  assert.ok(near(r.thresholds.SOFT_YAW, Math.max(expectedMax * 1.1, 15), 1e-6), `SOFT_YAW=${r.thresholds.SOFT_YAW}`);
 });
 
 test("deriveThresholdsFromCorners: fewer than 4 → null", () => {
-  assert.equal(deriveThresholdsFromCorners([{ yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 }], FLOORS), null);
+  assert.equal(deriveThresholdsFromCorners([{ yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 }], DEFAULT_THRESHOLDS, FLOORS), null);
 });

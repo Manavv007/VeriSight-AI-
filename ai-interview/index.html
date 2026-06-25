@@ -38,8 +38,8 @@
 
       <ul class="cal-steps" id="cal-steps">
         <li>Grant webcam permission when prompted.</li>
-        <li>Sit naturally and look <strong>straight at the screen</strong>.</li>
-        <li>Hold still for a <strong>3-second</strong> baseline capture.</li>
+        <li><strong>4-corner</strong> (default, best accuracy): look at each screen corner as the dot moves to it.</li>
+        <li>Prefer speed? Toggle <strong>Quick</strong> to just hold a 3-second neutral pose instead.</li>
       </ul>
 
       <div id="cal-status" class="cal-status">Camera not started.</div>
@@ -47,7 +47,7 @@
       <div class="cal-actions">
         <button id="cal-start-btn" class="btn btn-primary">Start &amp; Calibrate</button>
         <button id="cal-mode-btn" class="btn btn-ghost" title="Quick = 3s neutral baseline. 4-corner = look at each screen corner so thresholds match your exact screen size and seating.">
-          Calibration: <span id="cal-mode-state">Quick</span>
+          Calibration: <span id="cal-mode-state">4-corner</span>
         </button>
         <button id="cal-skip-fs" class="btn btn-ghost" title="Recommended: fullscreen aligns the viewport with your physical screen">
           Fullscreen: <span id="cal-fs-state">On</span>
@@ -151,9 +151,9 @@
           </div>
           <!-- Live head/eye telemetry -->
           <div id="hud-telemetry" class="hud-telemetry" hidden>
-            <span>yaw <b id="hud-yaw">0</b>°</span>
-            <span>pitch <b id="hud-pitch">0</b>°</span>
-            <span>gaze <b id="hud-gaze">0,0</b></span>
+            <span>Δyaw <b id="hud-yaw">0</b>°</span>
+            <span>Δpitch <b id="hud-pitch">0</b>°</span>
+            <span>state <b id="hud-gaze">none</b></span>
           </div>
         </div>
         <div class="camera-legend">

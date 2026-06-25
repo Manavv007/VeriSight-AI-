@@ -11,13 +11,13 @@
 import { FaceLandmarker, FilesetResolver, DrawingUtils } from "../vendor/tasks-vision/vision_bundle.mjs";
 import {
   matrixToEuler, computeIrisGaze, computeBlendshapeGaze, decideLookingAway,
-  deriveThresholdsFromCorners, makeSmoother, DEFAULT_THRESHOLDS,
+  deriveThresholdsFromCorners, adaptBaseline, makeSmoother, DEFAULT_THRESHOLDS,
 } from "./gaze-math.mjs";
 
 const WASM_PATH = "./vendor/tasks-vision/wasm";
 const MODEL_PATH = "./models/face_landmarker.task";
 
-const CFG = Object.assign({ SMOOTH_WINDOW: 5 }, DEFAULT_THRESHOLDS);
+const CFG = Object.assign({ SMOOTH_WINDOW: 5, ADAPT_ALPHA: 0.04, ADAPT_ALPHA_GAZE: 0 }, DEFAULT_THRESHOLDS);
 
 const state = {
   landmarker: null,
@@ -31,6 +31,7 @@ const state = {
   onSignal: null,
   baseline: { yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 },
   calibrating: false,
+  adaptEnabled: false,
   calBuf: null,
   latest: null,
   smoothers: null,
@@ -146,7 +147,7 @@ function processResult(result) {
       facePresent: false, yaw: 0, pitch: 0, roll: 0, gazeX: 0, gazeY: 0,
       lookingAway: false, direction: null, calibrating: state.calibrating, ts: Date.now(),
     };
-    drawOverlay(null, false);
+    drawOverlay(null, "none");
   } else {
     const landmarks = result.faceLandmarks[0];
     const mtx = result.facialTransformationMatrixes && result.facialTransformationMatrixes[0];
@@ -173,16 +174,29 @@ function processResult(result) {
     }
 
     const decision = state.calibrating
-      ? { lookingAway: false, direction: null }
+      ? { level: "none", direction: null, confidence: 0, combinedYaw: 0, combinedPitch: 0 }
       : decideLookingAway(raw, state.baseline, CFG);
 
     signal = Object.assign(raw, {
-      lookingAway: decision.lookingAway,
+      level: decision.level,
+      lookingAway: decision.level === "hard",
       direction: decision.direction,
+      confidence: decision.confidence,
+      combinedYaw: decision.combinedYaw,
+      combinedPitch: decision.combinedPitch,
       calibrating: state.calibrating,
       ts: Date.now(),
     });
-    drawOverlay(landmarks, decision.lookingAway);
+    drawOverlay(landmarks, decision.level);
+
+    // Slow drift compensation: track the candidate's settled resting pose so a
+    // posture shift after calibration does not cause persistent false positives.
+    // Only adapts at level "none" (clearly on-screen) — frozen the moment any
+    // look-away (soft or hard) begins, so a developing/held look-away (e.g. looking
+    // down, which barely tilts the head) is never absorbed. Eye axis stays frozen.
+    if (state.adaptEnabled && !state.calibrating && decision.level === "none") {
+      state.baseline = adaptBaseline(state.baseline, raw, CFG.ADAPT_ALPHA, CFG.ADAPT_ALPHA_GAZE);
+    }
   }
 
   state.latest = signal;
@@ -192,7 +206,7 @@ function processResult(result) {
 // ------------------------------------------------------------------
 // Overlay
 // ------------------------------------------------------------------
-function drawOverlay(landmarks, away) {
+function drawOverlay(landmarks, level) {
   const cv = state.overlay, ctx = state.octx, d = state.drawer;
   if (!cv || !ctx) return;
   if (state.video && (cv.width !== state.video.videoWidth || cv.height !== state.video.videoHeight)) {
@@ -202,8 +216,9 @@ function drawOverlay(landmarks, away) {
   ctx.clearRect(0, 0, cv.width, cv.height);
   if (!landmarks || !d) return;
 
-  const meshColor = away ? "rgba(255,92,138,0.5)" : "rgba(45,226,198,0.35)";
-  const irisColor = away ? "#ff5c8a" : "#2de2c6";
+  const hard = level === "hard", soft = level === "soft";
+  const meshColor = hard ? "rgba(255,92,138,0.5)" : soft ? "rgba(255,180,84,0.45)" : "rgba(45,226,198,0.35)";
+  const irisColor = hard ? "#ff5c8a" : soft ? "#ffb454" : "#2de2c6";
   d.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_TESSELATION, { color: meshColor, lineWidth: 0.5 });
   d.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS, { color: irisColor, lineWidth: 2 });
   d.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS, { color: irisColor, lineWidth: 2 });
@@ -241,16 +256,18 @@ function captureWindow(durationMs = 3000) {
 function captureBaseline(durationMs = 3000) {
   return captureWindow(durationMs).then((avg) => {
     state.baseline = { yaw: avg.yaw, pitch: avg.pitch, gazeX: avg.gazeX, gazeY: avg.gazeY };
+    state.adaptEnabled = true;
     return avg;
   });
 }
 
-// 4-corner calibration: derive per-user baseline + thresholds from corner samples.
-function calibrateFromCorners(corners, floors, margin) {
-  const r = deriveThresholdsFromCorners(corners, floors, margin);
+// 4-corner calibration: derive per-user baseline + soft/hard thresholds.
+function calibrateFromCorners(corners, opts = {}) {
+  const r = deriveThresholdsFromCorners(corners, CFG, opts.floors, opts.softMargin, opts.hardMargin);
   if (!r) return null;
   state.baseline = r.baseline;
   Object.assign(CFG, r.thresholds);
+  state.adaptEnabled = true;
   return r;
 }
 

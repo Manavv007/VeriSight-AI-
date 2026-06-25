@@ -39,22 +39,33 @@ python -m http.server 8000
 ```
 Must be served over HTTP (ES modules + WASM do not load from file://).
 
-## Tuning (top of js/gaze-engine.js → CFG, defaults from gaze-math.mjs)
+## Detection model (combined gaze + soft/hard band)
 
-- `YAW_DEG` (18): head turn left/right before flagging.
-- `PITCH_DOWN_DEG` (16) / `PITCH_UP_DEG` (18): head nod thresholds.
-- `GAZE_X` (0.35) / `GAZE_Y_DOWN` (0.45): eye-only gaze thresholds. Eye gaze now comes
-  from MediaPipe eye-look blendshapes (scores ~ -1..1), so both eyes reinforce instead
-  of cancelling. Watch the `gaze` value on the camera HUD and tune to your setup.
-- `SMOOTH_WINDOW` (5): frames averaged to suppress jitter.
-- `INVERT_YAW` / `INVERT_GAZE_X`: flip if left/right labels read backwards on your cam.
-Detection is baseline-relative, so sitting slightly off-axis does not cause false flags.
+"Looking away" is judged on a **combined gaze** angle = head deviation + head-gated eye
+offset (`combinedYaw`, `combinedPitch`, degrees), all relative to the calibrated
+baseline. This is invariant to how a look splits between head and eyes, which removes
+head-tilt drift false positives. The eye term is **down-weighted as the head turns**
+(unreliable at large angles). Each axis uses a two-tier band:
+`soft` = possibly looking away (~50–80% confidence, visual cue only, **not logged**),
+`hard` = soft + tolerance = looking away (>=80%, **logged** after the sustain timer).
+
+## Tuning (gaze-math.mjs → DEFAULT_THRESHOLDS; corner mode overrides them)
+
+- `EYE_GAIN_X` (40) / `EYE_GAIN_Y` (30): degrees of gaze per unit of eye blendshape.
+- `HEAD_GATE_DEG` (25): head deviation at which the eye term is fully down-weighted.
+- `SOFT_YAW` (22) / `TOL_YAW` (14): horizontal soft / (hard = soft+tol = 36°).
+- `SOFT_PITCH_DOWN` (18) / `TOL_PITCH_DOWN` (12); `SOFT_PITCH_UP` (18) / `TOL_PITCH_UP` (12).
+- `SMOOTH_WINDOW` (5, in gaze-engine.js): frames averaged to suppress jitter.
+- `INVERT_YAW` / `INVERT_GAZE_X`: head-right and eye-right MUST agree in sign for the
+  combined model — flip one if left/right reads backwards or detection feels weak.
+- 4-corner mode derives `SOFT_*`/`TOL_*` from your real screen (`CORNER_*` in proctor.js).
+Detection is baseline-relative, so sitting off-axis does not cause false flags.
 
 ## Automated verification performed
 
-- `node --test` → 29/29 unit tests pass (Euler decomposition incl. scale, iris ratio,
-  blendshape eye gaze, fusion incl. baseline-relative + no-face, 4-corner threshold
-  derivation, smoother).
+- `node --test` → 36/36 unit tests pass (Euler decomposition incl. scale, iris ratio,
+  blendshape eye gaze, combined head+eye gaze, head-gated eye weighting, soft/hard band
+  + confidence, baseline-relative, 4-corner threshold derivation, smoother).
 - `node --check` passes for proctor.js, interview.js, gaze-math.mjs, and gaze-engine.js (ESM).
 - All DOM ids referenced by JS exist in index.html; all runtime assets present;
   no stale `webgazer` references.
@@ -63,9 +74,9 @@ Detection is baseline-relative, so sitting slightly off-axis does not cause fals
 
 ## Calibration modes (toggle on the welcome card before Start)
 
-- **Quick** (default): 3-second neutral baseline — look straight, hold still. Detection
+- **Quick** (optional): 3-second neutral baseline — look straight, hold still. Detection
   uses the default thresholds, baseline-relative.
-- **4-corner (precise)**: look at each screen corner (~2 s each). The app measures the
+- **4-corner (default, precise)**: look at each screen corner (~2 s each). The app measures the
   head/eye span across your real screen and seating, then derives per-user thresholds
   (`deriveThresholdsFromCorners`, clamped to safe floors × a 1.15 margin). Use this when
   you want "off screen" to match your exact monitor size rather than a fixed angle.

@@ -22,12 +22,14 @@
     AWAY_FLAG_MS: 4000,      // write a permanent flag
     FACE_LOST_MS: 1500,      // write a face-lost flag
     ENGINE_TIMEOUT_MS: 12000,// max wait for the engine module to load
+    SOFT_MIN_MS: 350,        // soft cue must persist this long before showing (debounce)
     PENALTY: { offscreen: 5, tabswitch: 8, facelost: 6 },
     // 4-corner calibration (optional precise mode)
     CORNER_READY_MS: 800,    // time to move eyes to the next corner before capturing
     CORNER_HOLD_MS: 1100,    // per-corner gaze capture window
-    CORNER_MARGIN: 1.15,     // thresholds = measured corner span × this
-    CORNER_FLOORS: { YAW_DEG: 10, PITCH: 10, GAZE_X: 0.18, GAZE_Y_DOWN: 0.22 },
+    CORNER_SOFT_MARGIN: 1.2, // soft band = on-screen combined-gaze edge × this
+    CORNER_HARD_MARGIN: 1.55, // hard band = edge × this (tolerance = hard − soft)
+    CORNER_FLOORS: { SOFT_YAW: 15, TOL_YAW: 8, SOFT_PITCH: 14, TOL_PITCH: 8 },
   };
 
   // ---------------------------------------------------------------
@@ -36,7 +38,7 @@
   const S = {
     calibrated: false,
     fullscreenPref: true,
-    calMode: "quick",        // "quick" (3s neutral baseline) | "corners" (4-corner)
+    calMode: "corners",      // "corners" (4-corner, screen-aware — default) | "quick" (3s baseline)
     sessionStart: 0,
     baseline: null,
     lastSignal: null,
@@ -44,8 +46,14 @@
     offscreen: { active: false, start: 0, warned: false, incident: null, dir: null },
     faceLost: { active: false, start: 0, incident: null },
     focusLost: { active: false, start: 0, incident: null },
+    softActive: false,
+    softStart: 0,
     windowFocused: true,
     clockTimer: null,
+    recording: false,
+    recBuf: [],
+    recStart: 0,
+    recLabel: "trace",
   };
 
   // ---------------------------------------------------------------
@@ -185,7 +193,11 @@
     setCenterLabel("Look here & hold still");
     if (el["cal-center"]) el["cal-center"].classList.remove("show");
 
-    const res = window.GazeEngine.calibrateFromCorners(corners, CFG.CORNER_FLOORS, CFG.CORNER_MARGIN);
+    const res = window.GazeEngine.calibrateFromCorners(corners, {
+      floors: CFG.CORNER_FLOORS,
+      softMargin: CFG.CORNER_SOFT_MARGIN,
+      hardMargin: CFG.CORNER_HARD_MARGIN,
+    });
     if (!res) {
       if (el["cal-card"]) el["cal-card"].hidden = false;
       setStatus("Could not derive calibration from corners. Try again.", "error");
@@ -205,8 +217,10 @@
       el["cal-accuracy-hint"].hidden = false;
       if (info.mode === "corners") {
         const t = window.GazeEngine ? window.GazeEngine.getThresholds() : {};
+        const hardYaw = Math.round((t.SOFT_YAW || 0) + (t.TOL_YAW || 0));
+        const hardPitch = Math.round((t.SOFT_PITCH_DOWN || 0) + (t.TOL_PITCH_DOWN || 0));
         el["cal-accuracy-hint"].textContent =
-          `4-corner calibration set custom thresholds (head ±${Math.round(t.YAW_DEG)}°, eye ${Number(t.GAZE_X).toFixed(2)}). Recalibrate any time from the top bar.`;
+          `4-corner calibration set custom thresholds (looking-away at ~${hardYaw}° horizontal / ~${hardPitch}° vertical combined gaze). Recalibrate any time from the top bar.`;
       } else {
         el["cal-accuracy-hint"].textContent =
           `Baseline captured from ${info.samples} frames. Recalibrate any time from the top bar.`;
@@ -229,11 +243,19 @@
   function handleSignal(sig) {
     // Engine draws the overlay every frame regardless of calibration state.
     updateTelemetry(sig);
+    if (S.recording) {
+      S.recBuf.push({
+        tMs: Date.now() - S.recStart,
+        yaw: sig.yaw, pitch: sig.pitch, gazeX: sig.gazeX, gazeY: sig.gazeY,
+        facePresent: sig.facePresent,
+      });
+    }
     if (!S.calibrated) return;
 
     // While the window is unfocused / tab hidden, focus-loss tracking owns the
     // signal; suppress gaze-based episodes to avoid double counting.
     if (!S.windowFocused || document.hidden) {
+      clearSoft();
       closeOffscreen(true);
       closeFaceLost(true);
       return;
@@ -242,22 +264,54 @@
     S.lastSignal = sig;
 
     if (!sig.facePresent) {
+      clearSoft();
       closeOffscreen(true);
       handleFaceLost();
       return;
     }
     closeFaceLost(false);
 
-    if (sig.lookingAway) handleOffscreen(sig);
-    else closeOffscreen(false);
+    if (sig.level === "hard") {
+      S.softStart = 0;
+      clearSoft();
+      handleOffscreen(sig);
+    } else if (sig.level === "soft") {
+      closeOffscreen(false); // borderline → visual cue only, no permanent flag
+      if (!S.softStart) S.softStart = now();
+      if (now() - S.softStart >= CFG.SOFT_MIN_MS) showSoft(sig);
+    } else {
+      S.softStart = 0;
+      clearSoft();
+      closeOffscreen(false);
+    }
+  }
+
+  // Soft zone = "possibly looking away": a non-penalizing visual cue, never logged.
+  function showSoft(sig) {
+    S.softActive = true;
+    setFocusState("warn");
+    setGazeBadge("warn", "Possibly away");
+    showWarning(true, "Possibly looking away");
+    if (el.cameraCard) el.cameraCard.classList.add("alert");
+  }
+  function clearSoft() {
+    if (!S.softActive) return;
+    S.softActive = false;
+    if (!S.offscreen.active && !S.faceLost.active && !S.focusLost.active) {
+      showWarning(false);
+      if (el.cameraCard) el.cameraCard.classList.remove("alert");
+      setFocusState("ok");
+      setGazeBadge("ok", "On screen");
+    }
   }
 
   function updateTelemetry(sig) {
     if (!el["hud-telemetry"] || el["hud-telemetry"].hidden) return;
-    if (el["hud-yaw"]) el["hud-yaw"].textContent = sig.facePresent ? sig.yaw.toFixed(0) : "—";
-    if (el["hud-pitch"]) el["hud-pitch"].textContent = sig.facePresent ? sig.pitch.toFixed(0) : "—";
-    if (el["hud-gaze"]) el["hud-gaze"].textContent = sig.facePresent
-      ? `${sig.gazeX.toFixed(2)},${sig.gazeY.toFixed(2)}` : "—";
+    const cy = sig.combinedYaw != null ? Math.round(sig.combinedYaw) : 0;
+    const cp = sig.combinedPitch != null ? Math.round(sig.combinedPitch) : 0;
+    if (el["hud-yaw"]) el["hud-yaw"].textContent = sig.facePresent ? String(cy) : "—";
+    if (el["hud-pitch"]) el["hud-pitch"].textContent = sig.facePresent ? String(cp) : "—";
+    if (el["hud-gaze"]) el["hud-gaze"].textContent = sig.facePresent ? (sig.level || "none") : "—";
   }
 
   const DIR_TEXT = {
@@ -267,27 +321,29 @@
     down: "Looked down (toward desk or phone)",
   };
 
+  function awayDetail(dir, confidence) {
+    const base = DIR_TEXT[dir] || "Looked away from the screen";
+    const pct = confidence != null ? ` (~${Math.round(confidence * 100)}% confidence)` : "";
+    return base + pct;
+  }
+
   function handleOffscreen(sig) {
     const t = now();
     if (!S.offscreen.active) {
-      S.offscreen = { active: true, start: t, warned: false, incident: null, dir: sig.direction };
+      S.offscreen = { active: true, start: t, incident: null, dir: sig.direction };
+      // Hard level is already high-confidence → cue immediately.
+      setFocusState("warn");
+      setGazeBadge("warn", "Looking away");
+      showWarning(true, "Looking away");
+      if (el.cameraCard) el.cameraCard.classList.add("alert");
     }
     const elapsed = t - S.offscreen.start;
 
-    if (elapsed >= CFG.AWAY_WARN_MS && !S.offscreen.warned) {
-      S.offscreen.warned = true;
-      showWarning(true, "Looking away");
-      setFocusState("warn");
-      if (el.cameraCard) el.cameraCard.classList.add("alert");
-      setGazeBadge("warn", "Looking away");
-    }
-
     if (elapsed >= CFG.AWAY_FLAG_MS && !S.offscreen.incident) {
       setFocusState("bad");
-      const dir = S.offscreen.dir;
       S.offscreen.incident = logIncident({
         type: "offscreen",
-        details: DIR_TEXT[dir] || "Looked away from the screen",
+        details: awayDetail(S.offscreen.dir, sig.confidence),
         durationMs: elapsed,
         metrics: snapshot(sig),
       });
@@ -299,10 +355,10 @@
   function closeOffscreen(silent) {
     if (!S.offscreen.active) return;
     if (S.offscreen.incident) updateIncidentDuration(S.offscreen.incident, now() - S.offscreen.start);
-    S.offscreen = { active: false, start: 0, warned: false, incident: null, dir: null };
-    showWarning(false);
-    if (el.cameraCard) el.cameraCard.classList.remove("alert");
-    if (!S.faceLost.active && !S.focusLost.active) {
+    S.offscreen = { active: false, start: 0, incident: null, dir: null };
+    if (!S.softActive) showWarning(false);
+    if (el.cameraCard && !S.softActive) el.cameraCard.classList.remove("alert");
+    if (!S.faceLost.active && !S.focusLost.active && !S.softActive) {
       setFocusState("ok");
       setGazeBadge("ok", "On screen");
     }
@@ -346,6 +402,10 @@
       roll: Math.round(sig.roll * 10) / 10,
       gazeX: Math.round(sig.gazeX * 100) / 100,
       gazeY: Math.round(sig.gazeY * 100) / 100,
+      combinedYaw: sig.combinedYaw != null ? Math.round(sig.combinedYaw * 10) / 10 : null,
+      combinedPitch: sig.combinedPitch != null ? Math.round(sig.combinedPitch * 10) / 10 : null,
+      confidence: sig.confidence != null ? Math.round(sig.confidence * 100) / 100 : null,
+      level: sig.level || null,
       direction: sig.direction || null,
     };
   }
@@ -584,11 +644,15 @@
         durationMs: i.durationMs,
         details: i.details,
         direction: i.metrics ? i.metrics.direction : null,
+        level: i.metrics ? i.metrics.level : null,
+        confidence: i.metrics ? i.metrics.confidence : null,
         yaw: i.metrics ? i.metrics.yaw : null,
         pitch: i.metrics ? i.metrics.pitch : null,
         roll: i.metrics ? i.metrics.roll : null,
         gazeX: i.metrics ? i.metrics.gazeX : null,
         gazeY: i.metrics ? i.metrics.gazeY : null,
+        combinedYaw: i.metrics ? i.metrics.combinedYaw : null,
+        combinedPitch: i.metrics ? i.metrics.combinedPitch : null,
       })),
       interview: responses,
     };
@@ -632,11 +696,13 @@
     lines.push(`Tab Switches,${report.summary.tabSwitches}`);
     lines.push(`Face Lost,${report.summary.faceLost}`);
     lines.push("");
-    lines.push("Incident #,Type,Timestamp,Duration,Direction,Yaw,Pitch,Roll,GazeX,GazeY,Details");
+    lines.push("Incident #,Type,Timestamp,Duration,Direction,Level,Confidence,Yaw,Pitch,Roll,GazeX,GazeY,CombinedYaw,CombinedPitch,Details");
     report.incidents.forEach((i) => {
       lines.push([
         i.id, csvCell(i.label), csvCell(i.timestamp), csvCell(durLabel(i.durationMs)),
-        csvCell(i.direction), i.yaw, i.pitch, i.roll, i.gazeX, i.gazeY, csvCell(i.details),
+        csvCell(i.direction), csvCell(i.level),
+        i.confidence != null ? Math.round(i.confidence * 100) + "%" : "",
+        i.yaw, i.pitch, i.roll, i.gazeX, i.gazeY, i.combinedYaw, i.combinedPitch, csvCell(i.details),
       ].join(","));
     });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -763,6 +829,34 @@
     exportCSV,
     finish: finishSession,
     recalibrate,
+    // ---- Trace recording for the headless eval harness (tools/) ----
+    // Usage in the browser console, AFTER calibration, while performing a scenario:
+    //   Proctor.startRecording("off-left")
+    //   ...look off the left edge for a few seconds...
+    //   Proctor.stopRecording({ flag: true, direction: "left", offFromMs: 300 })
+    // For an on-screen scenario:  Proctor.stopRecording({ flag: false })
+    // Drop the downloaded JSON into ai-interview/corpus/ and run: node tools/eval.mjs corpus
+    startRecording: (label) => {
+      S.recording = true; S.recStart = Date.now(); S.recBuf = []; S.recLabel = label || "trace";
+      return "recording: " + S.recLabel;
+    },
+    stopRecording: (expect) => {
+      S.recording = false;
+      const trace = {
+        label: S.recLabel,
+        expect: expect || {},
+        meta: {
+          baseline: S.baseline,
+          thresholds: window.GazeEngine ? window.GazeEngine.getThresholds() : null,
+          calMode: S.calMode,
+          recordedAt: new Date().toISOString(),
+        },
+        frames: S.recBuf.slice(),
+      };
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      download(`trace-${S.recLabel}-${stamp}.json`, JSON.stringify(trace), "application/json");
+      return `saved ${trace.frames.length} frames as trace-${S.recLabel}-…json`;
+    },
   };
 
   if (document.readyState === "loading") {
