@@ -30,6 +30,9 @@
     CORNER_SOFT_MARGIN: 1.2, // soft band = on-screen combined-gaze edge × this
     CORNER_HARD_MARGIN: 1.55, // hard band = edge × this (tolerance = hard − soft)
     CORNER_FLOORS: { SOFT_YAW: 15, TOL_YAW: 8, SOFT_PITCH: 14, TOL_PITCH: 8 },
+    // 9-point point-of-regard calibration (primary, screen-boundary)
+    GAZE_READY_MS: 700,      // time to move eyes to the next dot before capturing
+    GAZE_HOLD_MS: 900,       // per-dot capture window
   };
 
   // ---------------------------------------------------------------
@@ -38,7 +41,8 @@
   const S = {
     calibrated: false,
     fullscreenPref: true,
-    calMode: "corners",      // "corners" (4-corner, screen-aware — default) | "quick" (3s baseline)
+    calMode: "gaze",      // "gaze" (9-point point-of-regard, default) | "quick" (angular baseline) | "corners"
+    gazeModel: null,
     sessionStart: 0,
     baseline: null,
     lastSignal: null,
@@ -125,6 +129,7 @@
   // Quick mode: 3-second neutral baseline ("look straight, hold still").
   function runBaseline() {
     return new Promise((resolve, reject) => {
+      try { window.GazeEngine.clearGazeModel(); } catch (_) { }
       resetCenter();
       setCenterLabel("Look here & hold still");
       if (el["cal-card"]) el["cal-card"].hidden = true;
@@ -206,21 +211,76 @@
     finishCalibration({ mode: "corners", samples: corners.length, baseline: res.baseline });
   }
 
+  // PRIMARY: 9-point point-of-regard calibration. Builds a gaze→screen map so
+  // detection is based on whether the gaze POINT leaves the screen rectangle,
+  // independent of head position/distance.
+  async function runGazeCalibration() {
+    try { window.GazeEngine.clearGazeModel(); } catch (_) { }
+    if (el["cal-card"]) el["cal-card"].hidden = true;
+    if (el["cal-countdown"]) el["cal-countdown"].textContent = "";
+    if (el["cal-center"]) el["cal-center"].classList.add("show");
+
+    const xs = [0.08, 0.5, 0.92], ys = [0.10, 0.5, 0.90];
+    const pts = [];
+    for (const ny of ys) for (const nx of xs) pts.push([nx, ny]);
+
+    const samples = [];
+    try {
+      for (let i = 0; i < pts.length; i++) {
+        const [nx, ny] = pts[i];
+        positionCenter(nx * 100, ny * 100);
+        setCenterLabel(`Look at the dot (${i + 1}/${pts.length})`);
+        setStatus(`Calibrating ${i + 1} of ${pts.length} — keep your gaze on the dot…`);
+        await sleep(CFG.GAZE_READY_MS);
+        const s = await window.GazeEngine.captureSample(CFG.GAZE_HOLD_MS, { x: nx, y: ny });
+        samples.push(s);
+      }
+    } catch (err) {
+      resetCenter();
+      if (el["cal-center"]) el["cal-center"].classList.remove("show");
+      if (el["cal-card"]) el["cal-card"].hidden = false;
+      setStatus(err && err.message ? err.message : "Calibration failed. Try again.", "error");
+      throw err;
+    }
+    resetCenter();
+    setCenterLabel("Look here & hold still");
+    if (el["cal-center"]) el["cal-center"].classList.remove("show");
+
+    const model = window.GazeEngine.fitGaze(samples);
+    if (!model) {
+      if (el["cal-card"]) el["cal-card"].hidden = false;
+      setStatus("Could not fit the gaze model. Try again in even, front lighting.", "error");
+      throw new Error("fit failed");
+    }
+    finishCalibration({ mode: "gaze", samples: samples.length, model });
+  }
+
+  function runCalibrationByMode() {
+    if (S.calMode === "gaze") return runGazeCalibration();
+    if (S.calMode === "corners") return runCornerCalibration();
+    return runBaseline();
+  }
+
   function finishCalibration(info) {
     S.calibrated = true;
-    S.baseline = info.baseline;
+    if (info.baseline) S.baseline = info.baseline;
+    if (info.model) S.gazeModel = info.model;
     S.calMode = info.mode || S.calMode;
     S.sessionStart = Date.now();
 
     if (el["accuracy-value"]) el["accuracy-value"].textContent = "Live ✓";
     if (el["cal-accuracy-hint"]) {
       el["cal-accuracy-hint"].hidden = false;
-      if (info.mode === "corners") {
+      if (info.mode === "gaze") {
+        const errPct = (Math.sqrt(info.model.residual || 0) * 100).toFixed(1);
+        el["cal-accuracy-hint"].textContent =
+          `9-point gaze map fitted (fit error ≈ ${errPct}% of screen). Looking outside the screen is now flagged regardless of head position or distance. Recalibrate any time.`;
+      } else if (info.mode === "corners") {
         const t = window.GazeEngine ? window.GazeEngine.getThresholds() : {};
         const hardYaw = Math.round((t.SOFT_YAW || 0) + (t.TOL_YAW || 0));
         const hardPitch = Math.round((t.SOFT_PITCH_DOWN || 0) + (t.TOL_PITCH_DOWN || 0));
         el["cal-accuracy-hint"].textContent =
-          `4-corner calibration set custom thresholds (looking-away at ~${hardYaw}° horizontal / ~${hardPitch}° vertical combined gaze). Recalibrate any time from the top bar.`;
+          `4-corner calibration set custom thresholds (looking-away at ~${hardYaw}° horizontal / ~${hardPitch}° vertical). Recalibrate any time.`;
       } else {
         el["cal-accuracy-hint"].textContent =
           `Baseline captured from ${info.samples} frames. Recalibrate any time from the top bar.`;
@@ -234,7 +294,7 @@
 
     startSessionClock();
     attachProctorListeners();
-    document.dispatchEvent(new CustomEvent("gazeproctor:ready", { detail: { baseline: info.baseline, mode: S.calMode } }));
+    document.dispatchEvent(new CustomEvent("gazeproctor:ready", { detail: { mode: S.calMode } }));
   }
 
   // ===============================================================
@@ -247,6 +307,7 @@
       S.recBuf.push({
         tMs: Date.now() - S.recStart,
         yaw: sig.yaw, pitch: sig.pitch, gazeX: sig.gazeX, gazeY: sig.gazeY,
+        tx: sig.tx, ty: sig.ty, tz: sig.tz,
         facePresent: sig.facePresent,
       });
     }
@@ -307,10 +368,13 @@
 
   function updateTelemetry(sig) {
     if (!el["hud-telemetry"] || el["hud-telemetry"].hidden) return;
-    const cy = sig.combinedYaw != null ? Math.round(sig.combinedYaw) : 0;
-    const cp = sig.combinedPitch != null ? Math.round(sig.combinedPitch) : 0;
-    if (el["hud-yaw"]) el["hud-yaw"].textContent = sig.facePresent ? String(cy) : "—";
-    if (el["hud-pitch"]) el["hud-pitch"].textContent = sig.facePresent ? String(cp) : "—";
+    if (sig.facePresent && sig.por) {
+      if (el["hud-yaw"]) el["hud-yaw"].textContent = Math.round(sig.por.x * 100);
+      if (el["hud-pitch"]) el["hud-pitch"].textContent = Math.round(sig.por.y * 100);
+    } else {
+      if (el["hud-yaw"]) el["hud-yaw"].textContent = sig.facePresent ? Math.round(sig.combinedYaw || 0) : "—";
+      if (el["hud-pitch"]) el["hud-pitch"].textContent = sig.facePresent ? Math.round(sig.combinedPitch || 0) : "—";
+    }
     if (el["hud-gaze"]) el["hud-gaze"].textContent = sig.facePresent ? (sig.level || "none") : "—";
   }
 
@@ -764,7 +828,7 @@
 
     // Camera + engine already running → recapture directly in the chosen mode.
     if (window.GazeEngine && window.GazeEngine.isReady()) {
-      (S.calMode === "corners" ? runCornerCalibration() : runBaseline()).catch(() => { });
+      runCalibrationByMode().catch(() => { });
     } else if (el["cal-card"]) {
       el["cal-card"].hidden = false;
     }
@@ -779,8 +843,7 @@
       if (S.fullscreenPref) await requestFullscreen();
       try {
         await startEngine();
-        if (S.calMode === "corners") await runCornerCalibration();
-        else await runBaseline();
+        await runCalibrationByMode();
       } catch (err) {
         el["cal-start-btn"].disabled = false;
         if (el["cal-card"]) el["cal-card"].hidden = false;
@@ -790,8 +853,8 @@
 
     if (el["cal-mode-btn"]) {
       el["cal-mode-btn"].addEventListener("click", () => {
-        S.calMode = S.calMode === "quick" ? "corners" : "quick";
-        if (el["cal-mode-state"]) el["cal-mode-state"].textContent = S.calMode === "corners" ? "4-corner" : "Quick";
+        S.calMode = S.calMode === "gaze" ? "quick" : "gaze";
+        if (el["cal-mode-state"]) el["cal-mode-state"].textContent = S.calMode === "gaze" ? "9-point" : "Quick";
       });
     }
 
@@ -847,6 +910,7 @@
         expect: expect || {},
         meta: {
           baseline: S.baseline,
+          gazeModel: S.gazeModel || (window.GazeEngine && window.GazeEngine.getPoRModel ? window.GazeEngine.getPoRModel() : null),
           thresholds: window.GazeEngine ? window.GazeEngine.getThresholds() : null,
           calMode: S.calMode,
           recordedAt: new Date().toISOString(),

@@ -8,6 +8,7 @@
 import {
   decideLookingAway, adaptBaseline, deriveThresholdsFromCorners, DEFAULT_THRESHOLDS,
 } from "./gaze-math.mjs";
+import { predictPoR, decideBoundary, DEFAULT_BOUNDARY } from "./gaze-mapping.mjs";
 
 // Timing + adaptation defaults (mirror gaze-engine.js / proctor.js CFG).
 export const DEFAULT_TIMING = {
@@ -23,9 +24,10 @@ export const DEFAULT_TIMING = {
    returns { level, direction, confidence, combinedYaw, combinedPitch, facePresent, softActive, incident }
    `incident` is non-null only on the frame an incident is first logged. */
 export function createDetector(opts = {}) {
-  const cfg = Object.assign({}, DEFAULT_THRESHOLDS, DEFAULT_TIMING, opts.thresholds, opts.timing);
+  const cfg = Object.assign({}, DEFAULT_THRESHOLDS, DEFAULT_BOUNDARY, DEFAULT_TIMING, opts.thresholds, opts.timing);
   let baseline = opts.baseline ? { ...opts.baseline } : { yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 };
   const adaptEnabled = opts.adaptEnabled !== false;
+  const poRModel = opts.poRModel || null;
 
   const incidents = [];
   let idc = 0;
@@ -60,10 +62,18 @@ export function createDetector(opts = {}) {
     }
     if (faceLost.active) closeFace();
 
-    const d = decideLookingAway(frame, baseline, cfg);
-
-    if (d.level === "none" && adaptEnabled) {
-      baseline = adaptBaseline(baseline, frame, cfg.ADAPT_ALPHA, cfg.ADAPT_ALPHA_GAZE);
+    let d, por = null;
+    if (poRModel) {
+      por = predictPoR(poRModel, {
+        headYaw: frame.yaw, headPitch: frame.pitch, gazeX: frame.gazeX, gazeY: frame.gazeY,
+        tx: frame.tx, ty: frame.ty, tz: frame.tz,
+      });
+      d = decideBoundary(por, cfg);
+    } else {
+      d = decideLookingAway(frame, baseline, cfg);
+      if (d.level === "none" && adaptEnabled) {
+        baseline = adaptBaseline(baseline, frame, cfg.ADAPT_ALPHA, cfg.ADAPT_ALPHA_GAZE);
+      }
     }
 
     if (d.level === "hard") {
@@ -112,9 +122,10 @@ const round1 = (v) => (typeof v === "number" ? Math.round(v * 10) / 10 : v);
    and the trace's recorded baseline (the calibration context). */
 export function replayTrace(trace, overrides = {}) {
   const det = createDetector({
-    thresholds: Object.assign({}, trace.meta && trace.meta.thresholds ? {} : {}, overrides.thresholds),
+    thresholds: overrides.thresholds,
     timing: overrides.timing,
     baseline: trace.meta ? trace.meta.baseline : undefined,
+    poRModel: (trace.meta && trace.meta.gazeModel) || overrides.poRModel || null,
   });
   const perFrame = [];
   for (const f of trace.frames) {

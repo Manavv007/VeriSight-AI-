@@ -13,11 +13,12 @@ import {
   matrixToEuler, computeIrisGaze, computeBlendshapeGaze, decideLookingAway,
   deriveThresholdsFromCorners, adaptBaseline, makeSmoother, DEFAULT_THRESHOLDS,
 } from "./gaze-math.mjs";
+import { fitCalibration, predictPoR, decideBoundary, DEFAULT_BOUNDARY } from "./gaze-mapping.mjs";
 
 const WASM_PATH = "./vendor/tasks-vision/wasm";
 const MODEL_PATH = "./models/face_landmarker.task";
 
-const CFG = Object.assign({ SMOOTH_WINDOW: 5, ADAPT_ALPHA: 0.04, ADAPT_ALPHA_GAZE: 0 }, DEFAULT_THRESHOLDS);
+const CFG = Object.assign({ SMOOTH_WINDOW: 5, ADAPT_ALPHA: 0.04, ADAPT_ALPHA_GAZE: 0 }, DEFAULT_THRESHOLDS, DEFAULT_BOUNDARY);
 
 const state = {
   landmarker: null,
@@ -32,6 +33,7 @@ const state = {
   baseline: { yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 },
   calibrating: false,
   adaptEnabled: false,
+  poRModel: null,
   calBuf: null,
   latest: null,
   smoothers: null,
@@ -44,6 +46,9 @@ function freshSmoothers() {
     roll: makeSmoother(CFG.SMOOTH_WINDOW),
     gazeX: makeSmoother(CFG.SMOOTH_WINDOW),
     gazeY: makeSmoother(CFG.SMOOTH_WINDOW),
+    tx: makeSmoother(CFG.SMOOTH_WINDOW),
+    ty: makeSmoother(CFG.SMOOTH_WINDOW),
+    tz: makeSmoother(CFG.SMOOTH_WINDOW),
   };
 }
 
@@ -144,17 +149,18 @@ function processResult(result) {
   if (!hasFace) {
     if (state.smoothers) Object.values(state.smoothers).forEach((s) => s.reset());
     signal = {
-      facePresent: false, yaw: 0, pitch: 0, roll: 0, gazeX: 0, gazeY: 0,
-      lookingAway: false, direction: null, calibrating: state.calibrating, ts: Date.now(),
+      facePresent: false, yaw: 0, pitch: 0, roll: 0, gazeX: 0, gazeY: 0, tx: 0, ty: 0, tz: 0,
+      lookingAway: false, direction: null, level: "none", confidence: 0, por: null,
+      calibrating: state.calibrating, ts: Date.now(),
     };
     drawOverlay(null, "none");
   } else {
     const landmarks = result.faceLandmarks[0];
     const mtx = result.facialTransformationMatrixes && result.facialTransformationMatrixes[0];
     const euler = mtx ? matrixToEuler(mtx.data) : { yaw: 0, pitch: 0, roll: 0 };
+    // Head 3D position (camera space) from the matrix translation column (cm-ish).
+    const t = mtx ? mtx.data : null;
 
-    // Eye gaze: prefer MediaPipe's calibrated eye-look blendshapes (both eyes
-    // reinforce instead of cancelling); fall back to iris geometry if absent.
     const blend = result.faceBlendshapes && result.faceBlendshapes[0];
     const bGaze = blend ? computeBlendshapeGaze(blend.categories) : { valid: false };
     const gaze = bGaze.valid ? bGaze : computeIrisGaze(landmarks);
@@ -165,36 +171,45 @@ function processResult(result) {
     const roll = sm.roll.push(euler.roll);
     const gazeX = sm.gazeX.push(gaze.gazeX);
     const gazeY = sm.gazeY.push(gaze.gazeY);
+    const tx = sm.tx.push(t ? t[12] : 0);
+    const ty = sm.ty.push(t ? t[13] : 0);
+    const tz = sm.tz.push(t ? t[14] : 0);
 
-    const raw = { facePresent: true, yaw, pitch, roll, gazeX, gazeY };
+    const raw = { facePresent: true, yaw, pitch, roll, gazeX, gazeY, tx, ty, tz };
 
     if (state.calibrating && state.calBuf) {
       state.calBuf.yaw.push(yaw); state.calBuf.pitch.push(pitch);
       state.calBuf.gazeX.push(gazeX); state.calBuf.gazeY.push(gazeY);
+      state.calBuf.tx.push(tx); state.calBuf.ty.push(ty); state.calBuf.tz.push(tz);
     }
 
-    const decision = state.calibrating
-      ? { level: "none", direction: null, confidence: 0, combinedYaw: 0, combinedPitch: 0 }
-      : decideLookingAway(raw, state.baseline, CFG);
+    // PRIMARY: point-of-regard → screen boundary (head/distance independent).
+    // FALLBACK: angular head+eye model (used until a PoR model is calibrated).
+    let por = null, decision;
+    if (state.calibrating) {
+      decision = { level: "none", direction: null, confidence: 0 };
+    } else if (state.poRModel) {
+      por = predictPoR(state.poRModel, { headYaw: yaw, headPitch: pitch, gazeX, gazeY, tx, ty, tz });
+      decision = decideBoundary(por, CFG);
+    } else {
+      decision = decideLookingAway(raw, state.baseline, CFG);
+    }
 
     signal = Object.assign(raw, {
       level: decision.level,
       lookingAway: decision.level === "hard",
       direction: decision.direction,
       confidence: decision.confidence,
-      combinedYaw: decision.combinedYaw,
-      combinedPitch: decision.combinedPitch,
+      por,
+      combinedYaw: decision.combinedYaw != null ? decision.combinedYaw : 0,
+      combinedPitch: decision.combinedPitch != null ? decision.combinedPitch : 0,
       calibrating: state.calibrating,
       ts: Date.now(),
     });
     drawOverlay(landmarks, decision.level);
 
-    // Slow drift compensation: track the candidate's settled resting pose so a
-    // posture shift after calibration does not cause persistent false positives.
-    // Only adapts at level "none" (clearly on-screen) — frozen the moment any
-    // look-away (soft or hard) begins, so a developing/held look-away (e.g. looking
-    // down, which barely tilts the head) is never absorbed. Eye axis stays frozen.
-    if (state.adaptEnabled && !state.calibrating && decision.level === "none") {
+    // Drift compensation only applies to the angular FALLBACK (PoR is absolute).
+    if (!state.poRModel && state.adaptEnabled && !state.calibrating && decision.level === "none") {
       state.baseline = adaptBaseline(state.baseline, raw, CFG.ADAPT_ALPHA, CFG.ADAPT_ALPHA_GAZE);
     }
   }
@@ -232,7 +247,7 @@ function drawOverlay(landmarks, level) {
 // neutral baseline and for each target of the 4-corner calibration.
 function captureWindow(durationMs = 3000) {
   return new Promise((resolve, reject) => {
-    state.calBuf = { yaw: [], pitch: [], gazeX: [], gazeY: [] };
+    state.calBuf = { yaw: [], pitch: [], gazeX: [], gazeY: [], tx: [], ty: [], tz: [] };
     state.calibrating = true;
     setTimeout(() => {
       state.calibrating = false;
@@ -246,10 +261,27 @@ function captureWindow(durationMs = 3000) {
       resolve({
         yaw: avg(buf.yaw), pitch: avg(buf.pitch),
         gazeX: avg(buf.gazeX), gazeY: avg(buf.gazeY),
+        tx: avg(buf.tx), ty: avg(buf.ty), tz: avg(buf.tz),
         samples: buf.yaw.length,
       });
     }, durationMs);
   });
+}
+
+// Capture one calibration target: average features while the candidate looks at a
+// known screen point. Returns a PoR calibration sample (raw head + eye + 3D pos).
+function captureSample(durationMs, target) {
+  return captureWindow(durationMs).then((w) => ({
+    headYaw: w.yaw, headPitch: w.pitch, gazeX: w.gazeX, gazeY: w.gazeY,
+    tx: w.tx, ty: w.ty, tz: w.tz, target, samples: w.samples,
+  }));
+}
+
+// Fit the point-of-regard model from 9 (or N) captured calibration samples.
+function fitGaze(samples) {
+  const model = fitCalibration(samples);
+  if (model) { state.poRModel = model; state.adaptEnabled = false; }
+  return model;
 }
 
 // Quick neutral baseline: capture "looking straight at the screen" and store it.
@@ -287,7 +319,12 @@ window.GazeEngine = {
   resume,
   captureBaseline,
   captureWindow,
+  captureSample,
+  fitGaze,
   calibrateFromCorners,
+  hasGazeModel: () => !!state.poRModel,
+  getPoRModel: () => state.poRModel,
+  clearGazeModel: () => { state.poRModel = null; },
   getLatest: () => state.latest,
   getBaseline: () => Object.assign({}, state.baseline),
   setBaseline: (b) => { state.baseline = Object.assign({}, b); },

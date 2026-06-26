@@ -30,6 +30,23 @@ getUserMedia → FaceLandmarker.detectForVideo
         → proctor.js timers + audit + UI + JSON/CSV export
 ```
 
+## Detection model (point-of-regard → screen boundary; PRIMARY)
+
+Detection asks **"where on the screen is the gaze pointing, and is that point inside
+the screen rectangle?"** rather than "how far are the eyes from neutral." Each frame we
+trace a gaze ray from the **live 3D head position** (the facial transformation matrix's
+translation = head x/y/distance) along the total gaze angle (head + eye) to the screen
+plane, giving a normalized point-of-regard `por:{x,y}` in `[0,1]²`. A 9-point calibration
+fits the cm→screen map (`gaze-mapping.mjs`, with automatic yaw/pitch sign detection and
+eye-gain search). Because the ray uses the live head position, the same on-screen point
+maps to the same `por` regardless of head pose/distance — so moving closer/farther or
+tilting the head does **not** create blind spots (proven in `tests/gaze-mapping.test.mjs`).
+`decideBoundary` flags when `por` leaves the rectangle by a soft/hard margin; the angular
+model (below) is the **fallback** used before calibration / when 3D data is missing.
+
+Fallback (angular): combined head+eye gaze vs a baseline with a soft/hard band, head-gated
+eye term, and slow drift adaptation.
+
 ## How to run
 
 ```bash
@@ -39,31 +56,25 @@ python -m http.server 8000
 ```
 Must be served over HTTP (ES modules + WASM do not load from file://).
 
-## Detection model (combined gaze + soft/hard band)
+## Calibration modes (toggle on the welcome card)
 
-"Looking away" is judged on a **combined gaze** angle = head deviation + head-gated eye
-offset (`combinedYaw`, `combinedPitch`, degrees), all relative to the calibrated
-baseline. This is invariant to how a look splits between head and eyes, which removes
-head-tilt drift false positives. The eye term is **down-weighted as the head turns**
-(unreliable at large angles). Each axis uses a two-tier band:
-`soft` = possibly looking away (~50–80% confidence, visual cue only, **not logged**),
-`hard` = soft + tolerance = looking away (>=80%, **logged** after the sustain timer).
+- **9-point** (default): follow the dot to 9 screen positions; fits the point-of-regard
+  gaze→screen map. Best accuracy; head/distance independent.
+- **Quick**: 3-second neutral baseline → angular fallback model.
 
-## Tuning (gaze-math.mjs → DEFAULT_THRESHOLDS; corner mode overrides them)
+## Tuning
 
-- `EYE_GAIN_X` (40) / `EYE_GAIN_Y` (30): degrees of gaze per unit of eye blendshape.
-- `HEAD_GATE_DEG` (25): head deviation at which the eye term is fully down-weighted.
-- `SOFT_YAW` (22) / `TOL_YAW` (14): horizontal soft / (hard = soft+tol = 36°).
-- `SOFT_PITCH_DOWN` (18) / `TOL_PITCH_DOWN` (12); `SOFT_PITCH_UP` (18) / `TOL_PITCH_UP` (12).
-- `SMOOTH_WINDOW` (5, in gaze-engine.js): frames averaged to suppress jitter.
-- `INVERT_YAW` / `INVERT_GAZE_X`: head-right and eye-right MUST agree in sign for the
-  combined model — flip one if left/right reads backwards or detection feels weak.
-- 4-corner mode derives `SOFT_*`/`TOL_*` from your real screen (`CORNER_*` in proctor.js).
-Detection is baseline-relative, so sitting off-axis does not cause false flags.
+Point-of-regard (`gaze-mapping.mjs` → `DEFAULT_BOUNDARY`):
+- `SOFT_MARGIN` (0.06) / `HARD_MARGIN` (0.14): how far `por` must be OUTSIDE [0,1] to
+  cue (soft) / flag (hard). Lower = more sensitive at the screen edge.
+
+Angular fallback (`gaze-math.mjs` → `DEFAULT_THRESHOLDS`):
+- `EYE_GAIN_X` (50) / `EYE_GAIN_Y` (30), `HEAD_GATE_DEG` (25), `SOFT_YAW`/`TOL_YAW`,
+  `SOFT_PITCH_DOWN`/`TOL_PITCH_DOWN`, `SOFT_PITCH_UP`/`TOL_PITCH_UP`, `INVERT_YAW` (true).
 
 ## Automated verification performed
 
-- `node --test` → 36/36 unit tests pass (Euler decomposition incl. scale, iris ratio,
+- `node --test` → 57/57 unit tests pass (point-of-regard fit + head/distance independence,
   blendshape eye gaze, combined head+eye gaze, head-gated eye weighting, soft/hard band
   + confidence, baseline-relative, 4-corner threshold derivation, smoother).
 - `node --check` passes for proctor.js, interview.js, gaze-math.mjs, and gaze-engine.js (ESM).
