@@ -35,6 +35,8 @@ const state = {
   adaptEnabled: false,
   poRModel: null,
   calBuf: null,
+  collectingFrames: false,
+  frameBuf: null,
   latest: null,
   smoothers: null,
 };
@@ -182,6 +184,9 @@ function processResult(result) {
       state.calBuf.gazeX.push(gazeX); state.calBuf.gazeY.push(gazeY);
       state.calBuf.tx.push(tx); state.calBuf.ty.push(ty); state.calBuf.tz.push(tz);
     }
+    if (state.collectingFrames && state.frameBuf) {
+      state.frameBuf.push({ headYaw: yaw, headPitch: pitch, gazeX, gazeY, tx, ty, tz });
+    }
 
     // PRIMARY: point-of-regard → screen boundary (head/distance independent).
     // FALLBACK: angular head+eye model (used until a PoR model is calibrated).
@@ -277,6 +282,23 @@ function captureSample(durationMs, target) {
   }));
 }
 
+// Collect per-frame samples over a window (NOT averaged) — used for the head-movement
+// calibration pass that identifies how head pose maps to the gaze point.
+function captureFrames(durationMs) {
+  return new Promise((resolve) => {
+    state.frameBuf = [];
+    state.collectingFrames = true;
+    state.calibrating = true;
+    setTimeout(() => {
+      state.collectingFrames = false;
+      state.calibrating = false;
+      const f = state.frameBuf || [];
+      state.frameBuf = null;
+      resolve(f);
+    }, durationMs);
+  });
+}
+
 // Fit the point-of-regard model from 9 (or N) captured calibration samples.
 function fitGaze(samples) {
   const model = fitCalibration(samples);
@@ -320,6 +342,7 @@ window.GazeEngine = {
   captureBaseline,
   captureWindow,
   captureSample,
+  captureFrames,
   fitGaze,
   calibrateFromCorners,
   hasGazeModel: () => !!state.poRModel,

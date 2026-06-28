@@ -33,6 +33,7 @@
     // 9-point point-of-regard calibration (primary, screen-boundary)
     GAZE_READY_MS: 700,      // time to move eyes to the next dot before capturing
     GAZE_HOLD_MS: 900,       // per-dot capture window
+    GAZE_HEADMOVE_MS: 4500,  // center head-movement pass (identifies head-pose mapping)
   };
 
   // ---------------------------------------------------------------
@@ -242,6 +243,22 @@
       setStatus(err && err.message ? err.message : "Calibration failed. Try again.", "error");
       throw err;
     }
+    // Head-movement pass: keep eyes on the centre dot while the head nods/turns, so
+    // the fit learns how head pose maps to the gaze point (moving the head later then
+    // does NOT cause false positives — this is the fix for "calibrated straight,
+    // tilted head, got flagged").
+    positionCenter(50, 50);
+    setCenterLabel("Keep looking here & slowly move your head");
+    setStatus("Almost done — keep your eyes on the dot and gently nod & turn your head…");
+    try {
+      await sleep(500);
+      const moveFrames = await window.GazeEngine.captureFrames(CFG.GAZE_HEADMOVE_MS);
+      const step = Math.max(1, Math.floor(moveFrames.length / 40)); // cap ~40 samples
+      for (let i = 0; i < moveFrames.length; i += step) {
+        samples.push(Object.assign({}, moveFrames[i], { target: { x: 0.5, y: 0.5 } }));
+      }
+    } catch (_) { /* head-move pass is best-effort */ }
+
     resetCenter();
     setCenterLabel("Look here & hold still");
     if (el["cal-center"]) el["cal-center"].classList.remove("show");

@@ -1,38 +1,40 @@
 /* =================================================================
-   gaze-mapping.mjs — point-of-regard (PoR) via geometric gaze-ray → screen plane
+   gaze-mapping.mjs — point-of-regard (PoR) via normalized ridge regression
    No DOM / no MediaPipe → unit-testable in Node.
 
-   Idea (head/distance INDEPENDENT by construction):
-   Each frame we know the head's 3D position (tx, ty, tz from MediaPipe's facial
-   transformation matrix; tz ≈ distance) and the total gaze angle (head + eye).
-   We trace the gaze ray to the screen plane (≈ the camera plane) to get the hit
-   point in cm:  X = tx + |tz|·tan(totalYaw),  Y = ty + |tz|·tan(totalPitch).
-   Because tx/ty/tz are LIVE, the same on-screen point yields the same X/Y no
-   matter where the head is — so moving closer/farther or turning the head does
-   NOT shift the boundary. Calibration only fits the cm→normalized-screen map.
+   Maps head pose + eye gaze + head position → a normalized on-screen point
+   (x,y in [0,1]). We deliberately use a LINEAR, feature-normalized, ridge-
+   regularized fit instead of an explicit tan()/distance ray-plane, because the
+   geometric form amplifies noisy MediaPipe inputs (a few degrees of head jitter
+   blew the point past ±400%). The regression:
+     - learns each feature's weight AND SIGN from data (no sign guessing),
+     - cancels head movement against the compensating eye movement when those
+       are seen together (the head-movement calibration pass provides this),
+     - stays bounded/stable (normalized features + ridge).
+   Head independence is LEARNED (from the head-movement pass), not assumed.
 
-   Convention: headYaw/​gazeX are already in a frame where "looking right" is
-   positive (the engine applies INVERT_YAW). Screen-normalized: x,y in [0,1],
-   (0,0) = top-left, (1,1) = bottom-right.
+   Screen-normalized: x,y in [0,1], (0,0) = top-left.
    ================================================================= */
 
-const DEG = Math.PI / 180;
+// Feature vectors (raw). X (horizontal): eye gaze + head yaw + head lateral pos.
+//                        Y (vertical):   eye gaze + head pitch + head vertical pos.
+function featuresX(s) { return [s.gazeX, s.headYaw, s.tx]; }
+function featuresY(s) { return [s.gazeY, s.headPitch, s.ty]; }
 
-/* Ray → screen-plane hit point in cm. fx/fy flip head yaw/pitch sign so head and
-   eye reinforce (sign convention auto-detected during calibration). */
-export function intersect(s, eyeGainDeg, fx = 1, fy = 1) {
-  const G = eyeGainDeg;
-  const dist = Math.abs(s.tz);
-  const totalYaw = fx * s.headYaw + G * s.gazeX;     // degrees
-  const totalPitch = fy * s.headPitch + G * s.gazeY; // degrees
-  const X = s.tx + dist * Math.tan(totalYaw * DEG);
-  const Y = s.ty + dist * Math.tan(totalPitch * DEG);
-  return { X, Y };
+function normStats(rows) {
+  const m = rows[0].length;
+  const mean = new Array(m).fill(0), std = new Array(m).fill(0);
+  for (const r of rows) for (let j = 0; j < m; j++) mean[j] += r[j];
+  for (let j = 0; j < m; j++) mean[j] /= rows.length;
+  for (const r of rows) for (let j = 0; j < m; j++) std[j] += (r[j] - mean[j]) ** 2;
+  for (let j = 0; j < m; j++) std[j] = Math.sqrt(std[j] / rows.length) || 1;
+  return { mean, std };
 }
+const applyNorm = (v, ns) => v.map((x, j) => (x - ns.mean[j]) / ns.std[j]);
+const dot = (a, b) => a.reduce((s, ai, i) => s + ai * b[i], 0);
 
-// Solve least-squares for coeffs c in (b ≈ A c), A: n×m rows, via normal equations
-// (AᵀA + λI) c = Aᵀb with tiny ridge for stability. Gaussian elimination.
-function lstsq(A, b, lambda = 1e-6) {
+// Ridge least squares; A rows include the bias column at index 0 (NOT regularized).
+function ridge(A, b, lambda) {
   const m = A[0].length;
   const M = Array.from({ length: m }, () => new Array(m).fill(0));
   const v = new Array(m).fill(0);
@@ -42,7 +44,7 @@ function lstsq(A, b, lambda = 1e-6) {
       for (let j = 0; j < m; j++) M[i][j] += A[r][i] * A[r][j];
     }
   }
-  for (let i = 0; i < m; i++) M[i][i] += lambda;
+  for (let i = 1; i < m; i++) M[i][i] += lambda; // skip bias (i=0)
   // Gaussian elimination
   for (let col = 0; col < m; col++) {
     let piv = col;
@@ -62,47 +64,29 @@ function lstsq(A, b, lambda = 1e-6) {
   return v;
 }
 
-/* fitCalibration(samples) → { eyeGain, cX, cY, residual }
-   samples = [{ headYaw, headPitch, gazeX, gazeY, tx, ty, tz, target:{x,y} }]
-   Searches eye-gain (deg per gaze unit) and fits a 2D affine cm→screen for each. */
+/* fitCalibration(samples, opts) → { nsX, nsY, cX, cY, residual }
+   samples = [{ headYaw, headPitch, gazeX, gazeY, tx, ty, tz, target:{x,y} }] */
 export function fitCalibration(samples, opts = {}) {
-  const gLo = opts.gMin == null ? 10 : opts.gMin;
-  const gHi = opts.gMax == null ? 45 : opts.gMax;
-  const gStep = opts.gStep == null ? 1 : opts.gStep;
-  let best = null;
-  for (const fx of [1, -1]) {
-    for (const fy of [1, -1]) {
-      for (let G = gLo; G <= gHi; G += gStep) {
-        const A = [], bx = [], by = [];
-        for (const s of samples) {
-          const { X, Y } = intersect(s, G, fx, fy);
-          A.push([1, X, Y]);
-          bx.push(s.target.x);
-          by.push(s.target.y);
-        }
-        const cX = lstsq(A, bx);
-        const cY = lstsq(A, by);
-        let res = 0;
-        for (let i = 0; i < A.length; i++) {
-          const px = cX[0] + cX[1] * A[i][1] + cX[2] * A[i][2];
-          const py = cY[0] + cY[1] * A[i][1] + cY[2] * A[i][2];
-          res += (px - bx[i]) ** 2 + (py - by[i]) ** 2;
-        }
-        res /= samples.length;
-        if (!best || res < best.residual) best = { eyeGain: G, fx, fy, cX, cY, residual: res };
-      }
-    }
+  const lambda = opts.lambda == null ? 0.3 : opts.lambda;
+  const rawX = samples.map(featuresX), rawY = samples.map(featuresY);
+  const nsX = normStats(rawX), nsY = normStats(rawY);
+  const AX = rawX.map((r) => [1, ...applyNorm(r, nsX)]);
+  const AY = rawY.map((r) => [1, ...applyNorm(r, nsY)]);
+  const cX = ridge(AX, samples.map((s) => s.target.x), lambda);
+  const cY = ridge(AY, samples.map((s) => s.target.y), lambda);
+  let res = 0;
+  for (let i = 0; i < samples.length; i++) {
+    res += (dot(cX, AX[i]) - samples[i].target.x) ** 2 + (dot(cY, AY[i]) - samples[i].target.y) ** 2;
   }
-  return best;
+  return { nsX, nsY, cX, cY, residual: res / samples.length };
 }
 
-/* predictPoR(model, s) → { x, y } normalized screen point. */
+/* predictPoR(model, s) → { x, y } normalized screen point (clamped to a sane range). */
 export function predictPoR(model, s) {
-  const { X, Y } = intersect(s, model.eyeGain, model.fx, model.fy);
-  return {
-    x: model.cX[0] + model.cX[1] * X + model.cX[2] * Y,
-    y: model.cY[0] + model.cY[1] * X + model.cY[2] * Y,
-  };
+  const fx = [1, ...applyNorm(featuresX(s), model.nsX)];
+  const fy = [1, ...applyNorm(featuresY(s), model.nsY)];
+  const clamp = (v) => Math.max(-1, Math.min(2, v));
+  return { x: clamp(dot(model.cX, fx)), y: clamp(dot(model.cY, fy)) };
 }
 
 export const DEFAULT_BOUNDARY = {
@@ -110,8 +94,7 @@ export const DEFAULT_BOUNDARY = {
   HARD_MARGIN: 0.14, // PoR this far outside → "off screen" (hard)
 };
 
-/* decideBoundary(por, cfg) → { level, direction, confidence, outside }
-   How far the point-of-regard is outside the screen rectangle decides soft/hard. */
+/* decideBoundary(por, cfg) → { level, direction, confidence, outside, por } */
 export function decideBoundary(por, cfg = DEFAULT_BOUNDARY) {
   const outX = por.x < 0 ? -por.x : por.x > 1 ? por.x - 1 : 0;
   const outY = por.y < 0 ? -por.y : por.y > 1 ? por.y - 1 : 0;

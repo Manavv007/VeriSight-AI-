@@ -86,12 +86,14 @@ function look(Sx, Sy, pose) {
 function frame(s) { return { yaw: s.headYaw, pitch: s.headPitch, gazeX: s.gazeX, gazeY: s.gazeY, tx: s.tx, ty: s.ty, tz: s.tz, facePresent: true }; }
 function poRModel() {
   const grid = [0, 0.5, 1], samples = [];
-  let k = 0;
   for (const ny of grid) for (const nx of grid) {
-    const pose = { ex: (k % 3 - 1) * 3, ey: 10, ez: 50, headYaw: (k % 3 - 1) * 5, headPitch: 0 };
-    const s = look(SCREEN.X0 + nx * SCREEN.W, SCREEN.Y0 + ny * SCREEN.H, pose);
+    const s = look(SCREEN.X0 + nx * SCREEN.W, SCREEN.Y0 + ny * SCREEN.H, { ex: 0, ey: 10, ez: 55, headYaw: 0, headPitch: 0 });
     samples.push(Object.assign(s, { target: { x: nx, y: ny } }));
-    k++;
+  }
+  for (let i = 0; i < 30; i++) { // center head-movement pass
+    const pose = { ex: (i % 5 - 2), ey: 10, ez: 55, headYaw: (i % 2 ? 1 : -1) * (4 + (i % 5) * 2.5), headPitch: (i % 3 - 1) * 7 };
+    const s = look(SCREEN.X0 + 0.5 * SCREEN.W, SCREEN.Y0 + 0.5 * SCREEN.H, pose);
+    samples.push(Object.assign(s, { target: { x: 0.5, y: 0.5 } }));
   }
   return fitCalibration(samples);
 }
