@@ -8,7 +8,7 @@
 import {
   decideLookingAway, adaptBaseline, deriveThresholdsFromCorners, DEFAULT_THRESHOLDS,
 } from "./gaze-math.mjs";
-import { predictPoR, decideBoundary, DEFAULT_BOUNDARY } from "./gaze-mapping.mjs";
+import { predictPoR, decidePoR, createPoRTracker, decideBoundary, DEFAULT_BOUNDARY } from "./gaze-mapping.mjs";
 
 // Timing + adaptation defaults (mirror gaze-engine.js / proctor.js CFG).
 export const DEFAULT_TIMING = {
@@ -28,6 +28,7 @@ export function createDetector(opts = {}) {
   let baseline = opts.baseline ? { ...opts.baseline } : { yaw: 0, pitch: 0, gazeX: 0, gazeY: 0 };
   const adaptEnabled = opts.adaptEnabled !== false;
   const poRModel = opts.poRModel || null;
+  const poRTracker = poRModel ? createPoRTracker(poRModel, cfg) : null;
 
   const incidents = [];
   let idc = 0;
@@ -64,11 +65,12 @@ export function createDetector(opts = {}) {
 
     let d, por = null;
     if (poRModel) {
-      por = predictPoR(poRModel, {
+      const r = poRTracker.step({
         headYaw: frame.yaw, headPitch: frame.pitch, gazeX: frame.gazeX, gazeY: frame.gazeY,
         tx: frame.tx, ty: frame.ty, tz: frame.tz,
       });
-      d = decideBoundary(por, cfg);
+      por = r.por;
+      d = r;
     } else {
       d = decideLookingAway(frame, baseline, cfg);
       if (d.level === "none" && adaptEnabled) {

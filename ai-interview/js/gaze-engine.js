@@ -13,7 +13,11 @@ import {
   matrixToEuler, computeIrisGaze, computeBlendshapeGaze, decideLookingAway,
   deriveThresholdsFromCorners, adaptBaseline, makeSmoother, DEFAULT_THRESHOLDS,
 } from "./gaze-math.mjs";
-import { fitCalibration, predictPoR, decideBoundary, DEFAULT_BOUNDARY } from "./gaze-mapping.mjs";
+import { fitCalibration, predictPoR, decidePoR, createPoRTracker, decideBoundary, DEFAULT_BOUNDARY } from "./gaze-mapping.mjs";
+import {
+  checkIrisLiveFrame, validateIrisSamples, validateIrisCorners,
+  createIrisPinnedTracker, IRIS_ANTICHEAT,
+} from "./cal-iris-anticheat.mjs";
 
 const WASM_PATH = "./vendor/tasks-vision/wasm";
 const MODEL_PATH = "./models/face_landmarker.task";
@@ -34,7 +38,10 @@ const state = {
   calibrating: false,
   adaptEnabled: false,
   poRModel: null,
+  poRTracker: null,
   calBuf: null,
+  calTarget: null,       // { x, y } during dot capture — for live iris anti-cheat
+  centerIrisX: null,
   collectingFrames: false,
   frameBuf: null,
   latest: null,
@@ -166,6 +173,9 @@ function processResult(result) {
     const blend = result.faceBlendshapes && result.faceBlendshapes[0];
     const bGaze = blend ? computeBlendshapeGaze(blend.categories) : { valid: false };
     const gaze = bGaze.valid ? bGaze : computeIrisGaze(landmarks);
+    const irisGaze = computeIrisGaze(landmarks);
+    const blendGazeX = bGaze.valid ? bGaze.gazeX : null;
+    const blendGazeY = bGaze.valid ? bGaze.gazeY : null;
 
     const sm = state.smoothers;
     const yaw = sm.yaw.push(euler.yaw);
@@ -176,13 +186,29 @@ function processResult(result) {
     const tx = sm.tx.push(t ? t[12] : 0);
     const ty = sm.ty.push(t ? t[13] : 0);
     const tz = sm.tz.push(t ? t[14] : 0);
+    const irisGazeX = irisGaze.valid ? irisGaze.gazeX : null;
+    const irisGazeY = irisGaze.valid ? irisGaze.gazeY : null;
+    // Anti-cheat prefers blendshape gaze (with inverted sign to match target direction)
+    // because raw iris-corner landmarks cancel out due to bilateral symmetry.
+    const antiCheatEyeX = blendGazeX != null ? -blendGazeX : irisGazeX;
+    const antiCheatEyeY = blendGazeY != null ? blendGazeY : irisGazeY;
+    const antiCheatEyeSource = blendGazeX != null ? "blend" : (irisGazeX != null ? "iris" : null);
 
-    const raw = { facePresent: true, yaw, pitch, roll, gazeX, gazeY, tx, ty, tz };
+    const raw = {
+      facePresent: true, yaw, pitch, roll, gazeX, gazeY, tx, ty, tz,
+      irisGazeX, irisGazeY, blendGazeX, blendGazeY,
+      antiCheatEyeX, antiCheatEyeY, antiCheatEyeSource,
+      landmarkCount: landmarks.length,
+    };
 
     if (state.calibrating && state.calBuf) {
       state.calBuf.yaw.push(yaw); state.calBuf.pitch.push(pitch);
       state.calBuf.gazeX.push(gazeX); state.calBuf.gazeY.push(gazeY);
       state.calBuf.tx.push(tx); state.calBuf.ty.push(ty); state.calBuf.tz.push(tz);
+      if (irisGazeX != null) state.calBuf.irisGazeX.push(irisGazeX);
+      if (irisGazeY != null) state.calBuf.irisGazeY.push(irisGazeY);
+      if (blendGazeX != null) state.calBuf.blendGazeX.push(blendGazeX);
+      if (blendGazeY != null) state.calBuf.blendGazeY.push(blendGazeY);
     }
     if (state.collectingFrames && state.frameBuf) {
       state.frameBuf.push({ headYaw: yaw, headPitch: pitch, gazeX, gazeY, tx, ty, tz });
@@ -194,8 +220,10 @@ function processResult(result) {
     if (state.calibrating) {
       decision = { level: "none", direction: null, confidence: 0 };
     } else if (state.poRModel) {
-      por = predictPoR(state.poRModel, { headYaw: yaw, headPitch: pitch, gazeX, gazeY, tx, ty, tz });
-      decision = decideBoundary(por, CFG);
+      const r = (state.poRTracker || (state.poRTracker = createPoRTracker(state.poRModel, CFG)))
+        .step({ headYaw: yaw, headPitch: pitch, gazeX, gazeY, tx, ty, tz });
+      por = r.por;
+      decision = r;
     } else {
       decision = decideLookingAway(raw, state.baseline, CFG);
     }
@@ -252,7 +280,10 @@ function drawOverlay(landmarks, level) {
 // neutral baseline and for each target of the 4-corner calibration.
 function captureWindow(durationMs = 3000) {
   return new Promise((resolve, reject) => {
-    state.calBuf = { yaw: [], pitch: [], gazeX: [], gazeY: [], tx: [], ty: [], tz: [] };
+    state.calBuf = {
+      yaw: [], pitch: [], gazeX: [], gazeY: [], tx: [], ty: [], tz: [],
+      irisGazeX: [], irisGazeY: [], blendGazeX: [], blendGazeY: [],
+    };
     state.calibrating = true;
     setTimeout(() => {
       state.calibrating = false;
@@ -262,11 +293,16 @@ function captureWindow(durationMs = 3000) {
         reject(new Error("No stable face detected — please face the camera and try again."));
         return;
       }
-      const avg = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+      const avg = (a) => (a.length ? a.reduce((s, v) => s + v, 0) / a.length : null);
+      const irisX = avg(buf.irisGazeX);
+      const blendX = avg(buf.blendGazeX);
       resolve({
         yaw: avg(buf.yaw), pitch: avg(buf.pitch),
         gazeX: avg(buf.gazeX), gazeY: avg(buf.gazeY),
         tx: avg(buf.tx), ty: avg(buf.ty), tz: avg(buf.tz),
+        irisGazeX: irisX, irisGazeY: avg(buf.irisGazeY),
+        blendGazeX: blendX, blendGazeY: avg(buf.blendGazeY),
+        antiCheatEyeX: irisX != null ? irisX : blendX,
         samples: buf.yaw.length,
       });
     }, durationMs);
@@ -278,8 +314,19 @@ function captureWindow(durationMs = 3000) {
 function captureSample(durationMs, target) {
   return captureWindow(durationMs).then((w) => ({
     headYaw: w.yaw, headPitch: w.pitch, gazeX: w.gazeX, gazeY: w.gazeY,
+    irisGazeX: w.irisGazeX, irisGazeY: w.irisGazeY,
+    blendGazeX: w.blendGazeX, blendGazeY: w.blendGazeY,
+    antiCheatEyeX: w.antiCheatEyeX,
     tx: w.tx, ty: w.ty, tz: w.tz, target, samples: w.samples,
   }));
+}
+
+function setCalTarget(target) {
+  state.calTarget = target ? { x: target.x, y: target.y } : null;
+}
+
+function setCenterIrisX(v) {
+  state.centerIrisX = typeof v === "number" ? v : null;
 }
 
 // Collect per-frame samples over a window (NOT averaged) — used for the head-movement
@@ -302,7 +349,7 @@ function captureFrames(durationMs) {
 // Fit the point-of-regard model from 9 (or N) captured calibration samples.
 function fitGaze(samples) {
   const model = fitCalibration(samples);
-  if (model) { state.poRModel = model; state.adaptEnabled = false; }
+  if (model) { state.poRModel = model; state.poRTracker = createPoRTracker(model, CFG); state.adaptEnabled = false; }
   return model;
 }
 
@@ -343,11 +390,18 @@ window.GazeEngine = {
   captureWindow,
   captureSample,
   captureFrames,
+  setCalTarget,
+  setCenterIrisX,
   fitGaze,
   calibrateFromCorners,
+  checkIrisLiveFrame,
+  validateIrisSamples,
+  validateIrisCorners,
+  createIrisPinnedTracker,
+  IRIS_ANTICHEAT,
   hasGazeModel: () => !!state.poRModel,
   getPoRModel: () => state.poRModel,
-  clearGazeModel: () => { state.poRModel = null; },
+  clearGazeModel: () => { state.poRModel = null; state.poRTracker = null; },
   getLatest: () => state.latest,
   getBaseline: () => Object.assign({}, state.baseline),
   setBaseline: (b) => { state.baseline = Object.assign({}, b); },

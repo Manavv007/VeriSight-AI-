@@ -90,7 +90,8 @@ export function ratio(p, a, b) {
    confirmed against the live overlay; detection uses baseline-relative
    magnitude so sign only affects the text label.) */
 export function computeIrisGaze(landmarks) {
-  if (!landmarks || landmarks.length < 478) return { gazeX: 0, gazeY: 0, valid: false };
+  // Face Landmarker iris mesh: 478 points (indices 0–477); iris centers at 468 & 473.
+  if (!landmarks || landmarks.length <= 473) return { gazeX: 0, gazeY: 0, valid: false };
 
   let sx = 0, sy = 0, n = 0;
   for (const key of ["a", "b"]) {

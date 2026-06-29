@@ -34,6 +34,7 @@
     GAZE_READY_MS: 700,      // time to move eyes to the next dot before capturing
     GAZE_HOLD_MS: 900,       // per-dot capture window
     GAZE_HEADMOVE_MS: 4500,  // center head-movement pass (identifies head-pose mapping)
+    GAZE_HEADPOSE_MS: 1800,  // per-position head-pose capture (whole-screen head coverage)
   };
 
   // ---------------------------------------------------------------
@@ -59,7 +60,260 @@
     recBuf: [],
     recStart: 0,
     recLabel: "trace",
+    // Incremented every time a calibration run is started or aborted.
+    // Each in-flight calibration captures its generation at launch and
+    // checks it at every await point — if it no longer matches, the run
+    // silently exits without calling finishCalibration.
+    calGeneration: 0,
   };
+
+  // ---------------------------------------------------------------
+  // Calibration Anti-Cheat Monitor (Defense 1 + Defense 2)
+  // Runs ONLY during calibration. Monitors raw head yaw from the
+  // camera frames. Does NOT touch any existing detection thresholds.
+  // ---------------------------------------------------------------
+  const CAL_ANTICHEAT = {
+    // Defense 1: if |yaw| exceeds this for SUSTAINED_MS → abort
+    HEAD_YAW_LIMIT: 40,      // degrees — well beyond any legitimate screen-edge look, allowing natural head turns
+    SUSTAINED_MS: 1200,      // how long the extreme yaw must persist before aborting
+
+    // Defense 2: rolling std-dev of last N yaw frames
+    VARIANCE_WINDOW: 50,     // frames (~1.3 s at 30 fps)
+    VARIANCE_THRESHOLD: 9,   // degrees std-dev — head sweeping left-right during cal
+
+    // Iris anti-cheat (Defenses 5 + 6) — uses sig.irisGazeX from landmark iris, not blendshapes
+    calTarget: null,         // { x, y } active dot during captureWindow
+    centerIrisX: null,       // reference iris at center dot
+    irisPinned: null,        // createIrisPinnedTracker() instance
+    dotPhase: false,         // 9-point / corner dot grid — head may move to reach dots
+    headPass: false,         // head-pose pass — deliberate head movement
+
+    // Internal runtime state (reset each calibration attempt)
+    active: false,
+    abortFn: null,           // set by startCalAntiCheat(), called to abort calibration
+    extremeStart: 0,         // timestamp when sustained extreme yaw began (D1)
+    yawHistory: [],          // rolling buffer for variance check (D2)
+  };
+
+  function ensureIrisPinned() {
+    if (!CAL_ANTICHEAT.irisPinned && window.GazeEngine && window.GazeEngine.createIrisPinnedTracker) {
+      CAL_ANTICHEAT.irisPinned = window.GazeEngine.createIrisPinnedTracker();
+    }
+  }
+
+  function eyeForAntiCheat(sig) {
+    if (!sig) return null;
+    if (sig.antiCheatEyeX != null) return sig.antiCheatEyeX;
+    if (sig.irisGazeX != null) return sig.irisGazeX;
+    if (sig.blendGazeX != null) return sig.blendGazeX;
+    return sig.gazeX != null ? sig.gazeX : null;
+  }
+
+  function eyeXFromSample(s) {
+    if (!s) return null;
+    if (s.antiCheatEyeX != null) return s.antiCheatEyeX;
+    if (s.irisGazeX != null) return s.irisGazeX;
+    if (s.blendGazeX != null) return s.blendGazeX;
+    return s.gazeX != null ? s.gazeX : null;
+  }
+
+  function startCalAntiCheat(abortFn) {
+    CAL_ANTICHEAT.active = true;
+    CAL_ANTICHEAT.abortFn = abortFn;
+    CAL_ANTICHEAT.extremeStart = 0;
+    CAL_ANTICHEAT.yawHistory = [];
+    CAL_ANTICHEAT.calTarget = null;
+    CAL_ANTICHEAT.centerIrisX = null;
+    CAL_ANTICHEAT.dotPhase = false;
+    CAL_ANTICHEAT.headPass = false;
+    CAL_ANTICHEAT.irisPinned = null;
+    ensureIrisPinned();
+  }
+
+  function stopCalAntiCheat() {
+    CAL_ANTICHEAT.active = false;
+    CAL_ANTICHEAT.abortFn = null;
+    CAL_ANTICHEAT.extremeStart = 0;
+    CAL_ANTICHEAT.yawHistory = [];
+    CAL_ANTICHEAT.calTarget = null;
+    CAL_ANTICHEAT.centerIrisX = null;
+    CAL_ANTICHEAT.dotPhase = false;
+    CAL_ANTICHEAT.headPass = false;
+    CAL_ANTICHEAT.irisPinned = null;
+    if (window.GazeEngine && window.GazeEngine.setCalTarget) window.GazeEngine.setCalTarget(null);
+  }
+
+  function setCalDotTarget(target) {
+    CAL_ANTICHEAT.calTarget = target ? { x: target.x, y: target.y } : null;
+    if (CAL_ANTICHEAT.irisPinned) CAL_ANTICHEAT.irisPinned.reset();
+    // Fresh head-yaw buffer per dot so moving between dots on a large screen
+    // does not accumulate into a false "head sweep" across the session.
+    CAL_ANTICHEAT.yawHistory = [];
+    CAL_ANTICHEAT.extremeStart = 0;
+    if (window.GazeEngine && window.GazeEngine.setCalTarget) window.GazeEngine.setCalTarget(target);
+  }
+
+  function setCalDotPhase(on) {
+    CAL_ANTICHEAT.dotPhase = !!on;
+    CAL_ANTICHEAT.yawHistory = [];
+    CAL_ANTICHEAT.extremeStart = 0;
+  }
+
+  function setCalHeadPass(on) {
+    CAL_ANTICHEAT.headPass = !!on;
+    CAL_ANTICHEAT.yawHistory = [];
+    CAL_ANTICHEAT.extremeStart = 0;
+  }
+
+  function calAntiCheatTick(sig) {
+    if (!CAL_ANTICHEAT.active || !sig.facePresent) return;
+
+    const yaw = sig.yaw; // raw head yaw in degrees from MediaPipe
+    const t = now();
+
+    // Head-yaw anti-cheat (Defenses 1 + 2) is OFF during dot-grid and head-pose
+    // passes — candidates naturally turn their head to reach dots on large screens.
+    const skipHeadChecks = CAL_ANTICHEAT.dotPhase || CAL_ANTICHEAT.headPass;
+
+    if (!skipHeadChecks) {
+      // ── Defense 2: rolling head-yaw variance check ───────────────────
+      const hist = CAL_ANTICHEAT.yawHistory;
+      hist.push(yaw);
+      if (hist.length > CAL_ANTICHEAT.VARIANCE_WINDOW) hist.shift();
+      if (hist.length >= CAL_ANTICHEAT.VARIANCE_WINDOW) {
+        const mean = hist.reduce((s, v) => s + v, 0) / hist.length;
+        const variance = hist.reduce((s, v) => s + (v - mean) ** 2, 0) / hist.length;
+        if (Math.sqrt(variance) > CAL_ANTICHEAT.VARIANCE_THRESHOLD) {
+          triggerCalCheat("head_sweep");
+          return;
+        }
+      }
+
+      // ── Defense 1: sustained extreme head yaw ───────────────────────
+      if (Math.abs(yaw) > CAL_ANTICHEAT.HEAD_YAW_LIMIT) {
+        if (!CAL_ANTICHEAT.extremeStart) {
+          CAL_ANTICHEAT.extremeStart = t;
+        } else if (t - CAL_ANTICHEAT.extremeStart >= CAL_ANTICHEAT.SUSTAINED_MS) {
+          triggerCalCheat("head_turn");
+          return;
+        }
+      } else {
+        CAL_ANTICHEAT.extremeStart = 0;
+      }
+    }
+
+    // Live frame-by-frame iris checks during calibration are disabled to avoid
+    // mirror-imaging sign convention conflicts. All iris cheat validation is done
+    // post-calibration in validateGazeSamples.
+  }
+
+  // Pearson correlation coefficient helper (legacy; iris validation is primary).
+  function pearsonCorrelation(x, y) {
+    const n = x.length;
+    if (n < 2) return 1.0;
+    const meanX = x.reduce((a, b) => a + b, 0) / n;
+    const meanY = y.reduce((a, b) => a + b, 0) / n;
+    let num = 0, denX = 0, denY = 0;
+    for (let i = 0; i < n; i++) {
+      const dx = x[i] - meanX;
+      const dy = y[i] - meanY;
+      num += dx * dy;
+      denX += dx * dx;
+      denY += dy * dy;
+    }
+    if (denX === 0 || denY === 0) return 0;
+    return num / Math.sqrt(denX * denY);
+  }
+
+  // Validates iris landmark samples at end of calibration using sign-aware Pearson correlation.
+  function validateGazeSamples(samples, mode) {
+    if (!samples || samples.length < 2) return true;
+
+    const xs_gaze = samples.map((s) => s.gazeX);
+
+    // Determine the active source to expect correct correlation sign.
+    // If blendGazeX is populated in samples, we are using blendshape coordinates.
+    const hasBlend = samples.some((s) => s.blendGazeX != null);
+
+    if (mode === "gaze") {
+      const xs_target = samples.map((s) => s.target.x);
+      const r_x = pearsonCorrelation(xs_target, xs_gaze);
+      console.log(`[AntiCheat] 9-point horizontal gaze correlation r_x = ${r_x.toFixed(3)} (source: ${hasBlend ? "blend" : "iris"})`);
+
+      // Validation logic:
+      // - Honest users tracking the dots must have:
+      //   - A negative correlation (r_x <= -0.60) if using blendshapes (since screen-right is negative).
+      //   - A positive correlation (r_x >= 0.60) if using landmarks (since screen-right is positive).
+      // - Cheaters looking opposite or looking away will violate this signed bound.
+      if (hasBlend) {
+        if (Math.abs(r_x) < 0.40) {
+          console.log(`[AntiCheat] Cheat detected: wrong or weak correlation for blendshape source (r_x = ${r_x.toFixed(3)})`);
+          return false;
+        }
+
+        // Limit maximum gaze deviation from center to catch extreme range-expansion looks.
+        const centerSample = samples.find(s => s.target && Math.abs(s.target.x - 0.5) < 0.05 && Math.abs(s.target.y - 0.5) < 0.05);
+        const centerIrisX = centerSample ? centerSample.gazeX : 0;
+        for (const s of samples) {
+          const deviation = Math.abs(s.gazeX - centerIrisX);
+          if (deviation > 0.58) {
+            console.log(`[AntiCheat] Cheat detected: extreme gaze look to expand calibration bounds (dev = ${deviation.toFixed(3)} > 0.58)`);
+            return false;
+          }
+        }
+      } else {
+        // Skip correlation check for landmark-only users because the raw landmark gaze signal
+        // cancels out due to bilateral symmetry, making correlation close to zero and unreliable.
+        console.log(`[AntiCheat] Landmark source active, skipping horizontal correlation check.`);
+      }
+
+      // Center-dot check: horizontal gaze must align closely with the calibration mean.
+      const meanX = xs_gaze.reduce((sum, val) => sum + val, 0) / xs_gaze.length;
+      for (const s of samples) {
+        const isCenterTarget = Math.abs(s.target.x - 0.5) < 0.05 && Math.abs(s.target.y - 0.5) < 0.05;
+        if (isCenterTarget) {
+          const dx = Math.abs(s.gazeX - meanX);
+          if (dx > 0.55) {
+            console.log(`[AntiCheat] Center dot look invalid (horizontal deviation too large): dx = ${dx.toFixed(3)}`);
+            return false;
+          }
+        }
+      }
+    } else if (mode === "corners") {
+      const xs_target = samples.map((s) => (s.corner.includes("right") ? 0.92 : 0.08));
+      const r_x = pearsonCorrelation(xs_target, xs_gaze);
+      console.log(`[AntiCheat] 4-corner horizontal gaze correlation r_x = ${r_x.toFixed(3)} (source: ${hasBlend ? "blend" : "iris"})`);
+
+      if (hasBlend) {
+        if (Math.abs(r_x) < 0.40) {
+          console.log(`[AntiCheat] Cheat detected: wrong or weak correlation for blendshape corner look (r_x = ${r_x.toFixed(3)})`);
+          return false;
+        }
+
+        // Limit maximum corner gaze deviation from center to catch extreme range-expansion looks.
+        const centerIrisX = xs_gaze.reduce((sum, val) => sum + val, 0) / xs_gaze.length;
+        for (const s of samples) {
+          const deviation = Math.abs(s.gazeX - centerIrisX);
+          if (deviation > 0.58) {
+            console.log(`[AntiCheat] Cheat detected: extreme corner gaze look (dev = ${deviation.toFixed(3)} > 0.58)`);
+            return false;
+          }
+        }
+      } else {
+        console.log(`[AntiCheat] Landmark source active, skipping horizontal correlation check.`);
+      }
+    }
+    return true;
+  }
+
+  function triggerCalCheat(reason) {
+    if (!CAL_ANTICHEAT.active) return; // already triggered or stopped
+    stopCalAntiCheat();
+    if (typeof CAL_ANTICHEAT.abortFn === "function") {
+      try { CAL_ANTICHEAT.abortFn(reason); } catch (_) { }
+    }
+    showCalCheatPopup(reason);
+  }
 
   // ---------------------------------------------------------------
   // DOM
@@ -73,7 +327,7 @@
       "focus-chip", "focus-state", "accuracy-value",
       "btn-fullscreen", "btn-recalibrate", "btn-finish",
       "camera-host", "camera-placeholder", "gaze-badge",
-      "cam-video", "cam-overlay", "hud-telemetry", "hud-yaw", "hud-pitch", "hud-gaze",
+      "cam-video", "cam-overlay", "hud-telemetry", "hud-yaw", "hud-pitch", "hud-gaze", "hud-eye",
       "btn-download-json", "btn-download-csv",
       "metric-flags", "metric-offscreen", "metric-tabswitch", "metric-facelost",
       "incident-list", "incident-empty", "integrity-score", "session-clock",
@@ -123,12 +377,23 @@
   // Calibration (quick neutral baseline OR 4-corner)
   // ===============================================================
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  function positionCenter(lx, ty) { const c = el["cal-center"]; if (c) { c.style.left = lx + "%"; c.style.top = ty + "%"; } }
-  function resetCenter() { const c = el["cal-center"]; if (c) { c.style.left = ""; c.style.top = ""; } }
+  function positionCenter(lx, ty) {
+    const c = el["cal-center"];
+    if (!c) return;
+    c.style.left = lx + "%"; c.style.top = ty + "%";
+    c.classList.toggle("label-above", ty > 55);              // bottom dots → label above
+    c.classList.remove("label-toleft", "label-toright");
+    if (lx > 70) c.classList.add("label-toleft");            // right dots → label hugs left
+    else if (lx < 30) c.classList.add("label-toright");      // left dots → label hugs right
+  }
+  function resetCenter() {
+    const c = el["cal-center"];
+    if (c) { c.style.left = ""; c.style.top = ""; c.classList.remove("label-above", "label-toleft", "label-toright"); }
+  }
   function setCenterLabel(t) { if (el["cal-center-label"]) el["cal-center-label"].textContent = t; }
 
   // Quick mode: 3-second neutral baseline ("look straight, hold still").
-  function runBaseline() {
+  function runBaseline(gen) {
     return new Promise((resolve, reject) => {
       try { window.GazeEngine.clearGazeModel(); } catch (_) { }
       resetCenter();
@@ -145,10 +410,26 @@
         if (remaining <= 0) clearInterval(cd);
       }, 1000);
 
+      setCalDotTarget({ x: 0.5, y: 0.5 });
       window.GazeEngine.captureBaseline(CFG.BASELINE_MS)
         .then((avg) => {
+          setCalDotTarget(null);
           clearInterval(cd);
           if (el["cal-center"]) el["cal-center"].classList.remove("show");
+          if (S.calGeneration !== gen) return; // stale — a newer run took over
+          
+          // Eye neutrality on center baseline (iris preferred, blend fallback).
+          const centerEyeX = avg.antiCheatEyeX ?? eyeXFromSample(avg);
+          if (centerEyeX != null && Math.abs(centerEyeX) > 0.15) {
+            triggerCalCheat("iris_cheat");
+            reject(new Error("cheat detected"));
+            return;
+          }
+          if (centerEyeX != null && window.GazeEngine.setCenterIrisX) {
+            window.GazeEngine.setCenterIrisX(centerEyeX);
+            CAL_ANTICHEAT.centerIrisX = centerEyeX;
+          }
+
           finishCalibration({
             mode: "quick",
             samples: avg.samples,
@@ -159,6 +440,7 @@
         .catch((err) => {
           clearInterval(cd);
           if (el["cal-center"]) el["cal-center"].classList.remove("show");
+          if (S.calGeneration !== gen) return;
           if (el["cal-card"]) el["cal-card"].hidden = false;
           setStatus(err && err.message ? err.message : "Calibration failed. Try again.", "error");
           reject(err);
@@ -168,7 +450,7 @@
 
   // Precise mode: look at each screen corner so thresholds match the real screen
   // size and seating distance.
-  async function runCornerCalibration() {
+  async function runCornerCalibration(gen) {
     if (el["cal-card"]) el["cal-card"].hidden = true;
     if (el["cal-countdown"]) el["cal-countdown"].textContent = "";
     if (el["cal-center"]) el["cal-center"].classList.add("show");
@@ -178,23 +460,40 @@
       ["bottom-left", 8, 88], ["bottom-right", 92, 88],
     ];
     const corners = [];
+    setCalDotPhase(true);
     try {
       for (let i = 0; i < seq.length; i++) {
+        if (S.calGeneration !== gen) return; // aborted
         const [name, lx, ty] = seq[i];
         positionCenter(lx, ty);
         setCenterLabel(`Look at the dot (${i + 1}/4)`);
         setStatus(`Calibrating corner ${i + 1} of 4 — keep your gaze on the dot…`);
         await sleep(CFG.CORNER_READY_MS);
+        if (S.calGeneration !== gen) return; // aborted during sleep
+        setCalDotTarget({ x: lx / 100, y: ty / 100 });
         const s = await window.GazeEngine.captureWindow(CFG.CORNER_HOLD_MS);
+        setCalDotTarget(null);
+        if (S.calGeneration !== gen) return; // aborted during capture
         corners.push(Object.assign({ corner: name }, s));
       }
     } catch (err) {
       resetCenter();
       if (el["cal-center"]) el["cal-center"].classList.remove("show");
+      if (S.calGeneration !== gen) return;
       if (el["cal-card"]) el["cal-card"].hidden = false;
       setStatus(err && err.message ? err.message : "Calibration failed. Try again.", "error");
       throw err;
+    } finally {
+      setCalDotPhase(false);
     }
+    if (S.calGeneration !== gen) return; // aborted
+
+    // Mathematically validate that eye horizontal movement corresponds to target locations
+    if (!validateGazeSamples(corners, "corners")) {
+      triggerCalCheat("iris_cheat");
+      throw new Error("cheat detected");
+    }
+
     resetCenter();
     setCenterLabel("Look here & hold still");
     if (el["cal-center"]) el["cal-center"].classList.remove("show");
@@ -215,50 +514,83 @@
   // PRIMARY: 9-point point-of-regard calibration. Builds a gaze→screen map so
   // detection is based on whether the gaze POINT leaves the screen rectangle,
   // independent of head position/distance.
-  async function runGazeCalibration() {
+  async function runGazeCalibration(gen) {
     try { window.GazeEngine.clearGazeModel(); } catch (_) { }
     if (el["cal-card"]) el["cal-card"].hidden = true;
     if (el["cal-countdown"]) el["cal-countdown"].textContent = "";
     if (el["cal-center"]) el["cal-center"].classList.add("show");
 
-    const xs = [0.08, 0.5, 0.92], ys = [0.10, 0.5, 0.90];
+    const xs = [0.04, 0.5, 0.96], ys = [0.05, 0.5, 0.95];
     const pts = [];
     for (const ny of ys) for (const nx of xs) pts.push([nx, ny]);
 
     const samples = [];
+    setCalDotPhase(true);
     try {
       for (let i = 0; i < pts.length; i++) {
+        if (S.calGeneration !== gen) return; // aborted
         const [nx, ny] = pts[i];
         positionCenter(nx * 100, ny * 100);
         setCenterLabel(`Look at the dot (${i + 1}/${pts.length})`);
         setStatus(`Calibrating ${i + 1} of ${pts.length} — keep your gaze on the dot…`);
         await sleep(CFG.GAZE_READY_MS);
+        if (S.calGeneration !== gen) return; // aborted during sleep
+        setCalDotTarget({ x: nx, y: ny });
         const s = await window.GazeEngine.captureSample(CFG.GAZE_HOLD_MS, { x: nx, y: ny });
+        setCalDotTarget(null);
+        if (S.calGeneration !== gen) return; // aborted during capture
         samples.push(s);
+        if (Math.abs(nx - 0.5) < 0.05 && Math.abs(ny - 0.5) < 0.05) {
+          const centerEyeX = eyeXFromSample(s);
+          if (centerEyeX != null) {
+            CAL_ANTICHEAT.centerIrisX = centerEyeX;
+            if (window.GazeEngine.setCenterIrisX) window.GazeEngine.setCenterIrisX(centerEyeX);
+          }
+        }
       }
     } catch (err) {
       resetCenter();
       if (el["cal-center"]) el["cal-center"].classList.remove("show");
+      if (S.calGeneration !== gen) return;
       if (el["cal-card"]) el["cal-card"].hidden = false;
       setStatus(err && err.message ? err.message : "Calibration failed. Try again.", "error");
       throw err;
+    } finally {
+      setCalDotPhase(false);
     }
-    // Head-movement pass: keep eyes on the centre dot while the head nods/turns, so
-    // the fit learns how head pose maps to the gaze point (moving the head later then
-    // does NOT cause false positives — this is the fix for "calibrated straight,
-    // tilted head, got flagged").
-    positionCenter(50, 50);
-    setCenterLabel("Keep looking here & slowly move your head");
-    setStatus("Almost done — keep your eyes on the dot and gently nod & turn your head…");
-    try {
-      await sleep(500);
-      const moveFrames = await window.GazeEngine.captureFrames(CFG.GAZE_HEADMOVE_MS);
-      const step = Math.max(1, Math.floor(moveFrames.length / 40)); // cap ~40 samples
-      for (let i = 0; i < moveFrames.length; i += step) {
-        samples.push(Object.assign({}, moveFrames[i], { target: { x: 0.5, y: 0.5 } }));
-      }
-    } catch (_) { /* head-move pass is best-effort */ }
 
+    // Mathematically validate the 9 grid points before proceeding to head-pose pass
+    if (!validateGazeSamples(samples, "gaze")) {
+      triggerCalCheat("iris_cheat");
+      throw new Error("cheat detected");
+    }
+
+    const headPts = [[0.5, 0.5], [0.04, 0.05], [0.96, 0.05], [0.04, 0.95], [0.96, 0.95]];
+    setCalHeadPass(false);
+    try {
+      for (let i = 0; i < headPts.length; i++) {
+        if (S.calGeneration !== gen) return; // aborted
+        const [nx, ny] = headPts[i];
+        positionCenter(nx * 100, ny * 100);
+        setCenterLabel(`Eyes on the dot — slowly move your head & lean in/out (${i + 1}/${headPts.length})`);
+        setStatus(`Head-pose calibration ${i + 1} of ${headPts.length} — keep your eyes on the dot while you turn, nod, and lean closer & farther…`);
+        await sleep(CFG.GAZE_READY_MS);
+        if (S.calGeneration !== gen) return; // aborted during sleep
+        setCalDotTarget({ x: nx, y: ny });
+        const frames = await window.GazeEngine.captureFrames(CFG.GAZE_HEADPOSE_MS);
+        setCalDotTarget(null);
+        if (S.calGeneration !== gen) return; // aborted during capture
+        const step = Math.max(1, Math.floor(frames.length / 16));
+        for (let j = 0; j < frames.length; j += step) {
+          samples.push(Object.assign({}, frames[j], { target: { x: nx, y: ny } }));
+        }
+      }
+    } catch (_) { /* head-pose pass is best-effort */ }
+    finally {
+      setCalHeadPass(false);
+    }
+
+    if (S.calGeneration !== gen) return; // aborted after head-pose pass
     resetCenter();
     setCenterLabel("Look here & hold still");
     if (el["cal-center"]) el["cal-center"].classList.remove("show");
@@ -273,9 +605,10 @@
   }
 
   function runCalibrationByMode() {
-    if (S.calMode === "gaze") return runGazeCalibration();
-    if (S.calMode === "corners") return runCornerCalibration();
-    return runBaseline();
+    const gen = ++S.calGeneration; // stamp this run; any previous run becomes stale
+    if (S.calMode === "gaze") return runGazeCalibration(gen);
+    if (S.calMode === "corners") return runCornerCalibration(gen);
+    return runBaseline(gen);
   }
 
   function finishCalibration(info) {
@@ -328,7 +661,11 @@
         facePresent: sig.facePresent,
       });
     }
-    if (!S.calibrated) return;
+    // Anti-cheat: monitor raw head pose during calibration.
+    if (!S.calibrated) {
+      calAntiCheatTick(sig);
+      return;
+    }
 
     // While the window is unfocused / tab hidden, focus-loss tracking owns the
     // signal; suppress gaze-based episodes to avoid double counting.
@@ -393,6 +730,16 @@
       if (el["hud-pitch"]) el["hud-pitch"].textContent = sig.facePresent ? Math.round(sig.combinedPitch || 0) : "—";
     }
     if (el["hud-gaze"]) el["hud-gaze"].textContent = sig.facePresent ? (sig.level || "none") : "—";
+    if (el["hud-eye"]) {
+      if (!sig.facePresent) {
+        el["hud-eye"].textContent = "—";
+      } else {
+        const iris = sig.irisGazeX != null ? sig.irisGazeX.toFixed(2) : "—";
+        const blend = sig.blendGazeX != null ? sig.blendGazeX.toFixed(2) : "—";
+        const src = sig.antiCheatEyeSource || "?";
+        el["hud-eye"].textContent = `i:${iris} b:${blend} (${src})`;
+      }
+    }
   }
 
   const DIR_TEXT = {
@@ -833,6 +1180,7 @@
   // ===============================================================
   function recalibrate() {
     S.calibrated = false;
+    stopCalAntiCheat(); // ensure monitor is off before restarting
     closeOffscreen(true);
     closeFaceLost(true);
     onFocusLostEnd();
@@ -851,6 +1199,64 @@
     }
   }
 
+  // Returns the user to the welcome card ("Start & Calibrate" screen) without
+  // auto-launching calibration. Used by the cheat popup restart button so the
+  // user consciously clicks Start again after reading the warning.
+  function resetToWelcomeCard() {
+    S.calGeneration++;  // invalidate any in-flight calibration run immediately
+    S.calibrated = false;
+    stopCalAntiCheat();
+    closeOffscreen(true);
+    closeFaceLost(true);
+    onFocusLostEnd();
+    if (S.clockTimer) clearInterval(S.clockTimer);
+
+    // Hide the app shell.
+    el.app.classList.remove("show");
+    el.app.setAttribute("aria-hidden", "true");
+
+    // Show the calibration overlay with the welcome card visible.
+    el["calibration-overlay"].classList.remove("hide");
+    el["calibration-overlay"].setAttribute("aria-hidden", "false");
+
+    // Make sure the dot is hidden and the card is shown.
+    if (el["cal-center"]) el["cal-center"].classList.remove("show");
+    if (el["cal-card"]) el["cal-card"].hidden = false;
+
+    // Re-enable the Start button so the user can click it again.
+    if (el["cal-start-btn"]) el["cal-start-btn"].disabled = false;
+
+    // Reset the status line.
+    setStatus("Camera not started.");
+  }
+
+  // ===============================================================
+  // Calibration Cheat Popup
+  // ===============================================================
+  function showCalCheatPopup(reason) {
+    const popup = document.getElementById("cal-cheat-popup");
+    if (!popup) return;
+    const reasonEl = document.getElementById("cal-cheat-reason");
+    if (reasonEl) {
+      const messages = {
+        head_sweep:  "Rapid head movement detected — your head was sweeping left-right during calibration.",
+        head_turn:   "Extreme head turn detected — your head was turned too far to one side.",
+        iris_cheat:  "Eye movement detected — your eyes were not tracking the calibration dot. Please look directly at the dot during calibration.",
+        iris_pinned: "Eye movement detected — your eyes were looking sideways while your head stayed still. Please look directly at the dot.",
+      };
+      reasonEl.textContent = messages[reason] || "Suspicious movement detected during calibration.";
+    }
+    popup.hidden = false;
+    popup.classList.add("show");
+  }
+
+  function hideCalCheatPopup() {
+    const popup = document.getElementById("cal-cheat-popup");
+    if (!popup) return;
+    popup.classList.remove("show");
+    setTimeout(() => { popup.hidden = true; }, 350);
+  }
+
   // ===============================================================
   // Init / wiring
   // ===============================================================
@@ -858,15 +1264,46 @@
     el["cal-start-btn"].addEventListener("click", async () => {
       el["cal-start-btn"].disabled = true;
       if (S.fullscreenPref) await requestFullscreen();
+
+      // Wrap the calibration in a promise that the anti-cheat can abort.
+      let abortReject = null;
+      const abortable = new Promise((_, reject) => { abortReject = reject; });
+      startCalAntiCheat((reason) => {
+        abortReject(Object.assign(new Error("cal_cheat:" + reason), { calCheat: true }));
+      });
+
       try {
         await startEngine();
-        await runCalibrationByMode();
+        ensureIrisPinned();
+        // Race calibration against an anti-cheat abort signal.
+        await Promise.race([runCalibrationByMode(), abortable]);
+        stopCalAntiCheat();
       } catch (err) {
+        stopCalAntiCheat();
         el["cal-start-btn"].disabled = false;
-        if (el["cal-card"]) el["cal-card"].hidden = false;
-        setStatus("Could not start: " + (err && err.message ? err.message : "camera permission denied"), "error");
+        if (err && err.calCheat) {
+          // Popup is already shown by triggerCalCheat — restore the start card.
+          if (el["cal-card"]) el["cal-card"].hidden = false;
+          if (el["cal-center"]) el["cal-center"].classList.remove("show");
+          setStatus("Calibration aborted — please look at the screen and try again.", "error");
+        } else {
+          if (el["cal-card"]) el["cal-card"].hidden = false;
+          setStatus("Could not start: " + (err && err.message ? err.message : "camera permission denied"), "error");
+        }
       }
     });
+
+    // Cheat popup: Restart Calibration button
+    // Goes back to the welcome card ("Start & Calibrate") — not auto-start —
+    // so the user consciously clicks Start after repositioning themselves.
+    const cheatRestartBtn = document.getElementById("cal-cheat-restart");
+    if (cheatRestartBtn) {
+      cheatRestartBtn.addEventListener("click", () => {
+        hideCalCheatPopup();
+        // Wait for the popup fade-out, then surface the welcome card.
+        setTimeout(() => resetToWelcomeCard(), 380);
+      });
+    }
 
     if (el["cal-mode-btn"]) {
       el["cal-mode-btn"].addEventListener("click", () => {

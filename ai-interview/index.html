@@ -153,6 +153,7 @@
           <div id="hud-telemetry" class="hud-telemetry" hidden>
             <span>gaze x <b id="hud-yaw">0</b>%</span>
             <span>gaze y <b id="hud-pitch">0</b>%</span>
+            <span>eye <b id="hud-eye">0,0</b></span>
             <span>state <b id="hud-gaze">none</b></span>
           </div>
         </div>
@@ -220,6 +221,24 @@
         <button id="summary-csv" class="btn btn-ghost">Download CSV Report</button>
         <button id="summary-close" class="btn btn-ghost">Close</button>
       </div>
+    </div>
+  </div>
+
+  <!-- ============================================================= -->
+  <!-- CALIBRATION CHEAT DETECTED POPUP                             -->
+  <!-- ============================================================= -->
+  <div id="cal-cheat-popup" class="overlay cal-cheat-overlay" aria-modal="true" role="alertdialog" aria-labelledby="cal-cheat-title" hidden>
+    <div class="glass cal-cheat-card">
+      <div class="cal-cheat-icon">⚠️</div>
+      <h2 id="cal-cheat-title" class="cal-cheat-title">Look at the Screen</h2>
+      <p class="cal-cheat-desc">
+        Suspicious head movement was detected during calibration.<br />
+        Please face the screen directly and keep your head still while the dot moves.
+      </p>
+      <p id="cal-cheat-reason" class="cal-cheat-reason"></p>
+      <button id="cal-cheat-restart" class="btn btn-primary cal-cheat-btn">
+        🔄 Restart Calibration
+      </button>
     </div>
   </div>
 
